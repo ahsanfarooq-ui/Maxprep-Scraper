@@ -1,0 +1,16 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS metadata
+__MACOSX/
+.DS_Store
+
+# Scraped data output (Railway writes these to /data volume)
+Texas_scraped_data/
+*_data_gaps_*.json
+*_box_scores_*.json
+*_accumulated_stats_*.json
+boys_basketball_teams_list.json
+girls_basketball_teams_list.json
