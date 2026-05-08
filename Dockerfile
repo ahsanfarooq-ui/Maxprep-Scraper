@@ -11,4 +11,6 @@ RUN mkdir -p /data
 
 ENV DATA_DIR=/data
 
-CMD ["python", "texas_data_gap_finder.py"]
+EXPOSE 8501
+
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]

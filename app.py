@@ -8,8 +8,8 @@ Expected runtime for 1800+ teams: ~30–45 minutes (vs 7 hours).
 
 
 HOW TO USE:::::===========================================================
-python texas_data_gap_finder.py --state TX --sport girls --season 2025-2026
-python texas_data_gap_finder.py --state TX --sport boys --season 2025-2026
+python app.py --state TX --sport girls --season 2025-2026
+python app.py --state TX --sport boys --season 2025-2026
 ==========================================================================
 """
 
