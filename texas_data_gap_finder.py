@@ -221,9 +221,9 @@ def _save_gaps(output_file, state_name, state_code, total_count, full_data, part
 
 def main():
     parser = argparse.ArgumentParser(description="Parallel HS Basketball Box Score Gap Finder")
-    parser.add_argument("--state", default="TX", help="State code (default: TX)")
-    parser.add_argument("--sport", default="boys", choices=["boys", "girls"], help="boys (default) or girls")
-    parser.add_argument("--season", default="2025-2026", help="Season (e.g., 2025-2026 or 25-26)")
+    parser.add_argument("--state", default=os.environ.get("STATE", "TX"), help="State code (default: TX)")
+    parser.add_argument("--sport", default=os.environ.get("SPORT", "boys"), choices=["boys", "girls"], help="boys (default) or girls")
+    parser.add_argument("--season", default=os.environ.get("SEASON", "2025-2026"), help="Season (e.g., 2025-2026 or 25-26)")
     args = parser.parse_args()
 
     state_code  = args.state.upper()
