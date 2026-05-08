@@ -235,16 +235,25 @@ def main():
 
     sport_label = args.sport.lower()
     # Input from state_teams_counter: boys_basketball_all_states_25-26.json
-    input_file = os.path.join(DATA_DIR, f"{sport_label}_basketball_all_states_{short_season}.json")
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+    # Look for input file in app directory (bundled with repo)
+    input_file = os.path.join(APP_DIR, f"{sport_label}_basketball_all_states_{short_season}.json")
 
     if not os.path.exists(input_file):
-        # Fallback to current season if specific one not found
-        fallback = os.path.join(DATA_DIR, f"{sport_label}_basketball_all_states.json")
+        # Try without season suffix (e.g. boys_basketball_all_states.json)
+        fallback = os.path.join(APP_DIR, f"{sport_label}_basketball_all_states.json")
         if os.path.exists(fallback):
             input_file = fallback
         else:
-            print(f"Error: Input file {input_file} not found.")
-            sys.exit(1)
+            print(f"Team list missing. Running state_teams_counter...")
+            state_teams_counter.run(sport=args.sport, season=short_season)
+            generated = os.path.join(DATA_DIR, f"{sport_label}_basketball_all_states_{short_season}.json")
+            if os.path.exists(generated):
+                input_file = generated
+            else:
+                print(f"Error: Input file not found.")
+                sys.exit(1)
 
     # Output: tx_data_gaps_boys_2025_2026.json
     season_fn = args.season.replace("-", "_")
