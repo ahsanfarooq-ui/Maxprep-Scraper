@@ -70,12 +70,19 @@ SESSION = _make_session()
 # ── Schedule helpers (same logic as texas_data_gap_finder.py) ─────────────────
 
 def get_build_id():
-    r = SESSION.get("https://www.maxpreps.com", timeout=20)
-    r.raise_for_status()
-    m = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", r.text)
-    if not m:
-        raise RuntimeError("MaxPreps build ID not found")
-    return m.group(1)
+    delays = [5, 10, 20, 40, 60]
+    for attempt, wait in enumerate(delays, 1):
+        try:
+            r = SESSION.get("https://www.maxpreps.com", timeout=30, headers=HTML_HEADERS)
+            r.raise_for_status()
+            m = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", r.text)
+            if m:
+                return m.group(1)
+            print(f"  [WARN] Build ID not found in page (attempt {attempt}/{len(delays)}). Waiting {wait}s…")
+        except Exception as e:
+            print(f"  [WARN] Build ID fetch error: {e} (attempt {attempt}/{len(delays)}). Waiting {wait}s…")
+        time.sleep(wait)
+    raise RuntimeError("MaxPreps build ID not found after all retries — MaxPreps may be rate-limiting. Try again later.")
 
 
 def team_url_to_path(team_url):
@@ -511,20 +518,26 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
 
         # ── Schedule (with retry logic) ──────────────────────────────────────
         contests = None
+        bid_retries = 0
         while contests is None:
             try:
                 path = team_url_to_path(team_url)
                 contests = fetch_schedule(build_id, path)
 
                 if isinstance(contests, dict) and contests.get("_expired"):
+                    bid_retries += 1
+                    if bid_retries > 3:
+                        print(f"  [WARN] Build ID refresh failed {bid_retries} times for {team_name}. Skipping.")
+                        contests = []
+                        break
                     print(f"  [INFO] Build ID expired or 404. Refreshing build ID...")
                     build_id = get_build_id()
                     print(f"  [INFO] New Build ID: {build_id}")
-                    contests = None # force retry with new build_id
+                    time.sleep(2)
+                    contests = None
                     continue
-                
+
                 if contests is None:
-                    # Some other non-404 error occurred in fetch_schedule
                     print(f"  [WARN] Schedule fetch returned None for {team_name}. Retrying in 5s...")
                     time.sleep(5)
                     continue
