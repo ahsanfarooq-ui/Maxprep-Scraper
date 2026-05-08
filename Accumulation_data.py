@@ -30,7 +30,7 @@ def process_stats(input_file=None, output_file=None):
         print(f"Error: {input_file} not found.")
         return
 
-    with open(input_file, 'r') as f:
+    with open(input_file, 'r', encoding='utf-8') as f:
         raw = json.load(f)
 
     # Handle both flat list and wrapped {"meta": ..., "games": [...]} format
@@ -249,8 +249,8 @@ def process_stats(input_file=None, output_file=None):
         for p_name, p_acc in players_accumulated.items():
             final_output_list.append(format_record(p_name, p_acc, "player"))
 
-    with open(output_file, 'w') as f:
-        json.dump(final_output_list, f, indent=4)
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(final_output_list, f, indent=4, ensure_ascii=False)
     
     print(f"Accumulation complete. Created {len(final_output_list)} records.")
     print(f"Data saved to {output_file}")

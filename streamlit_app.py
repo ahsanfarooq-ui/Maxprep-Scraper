@@ -1,8 +1,10 @@
 import re
-import streamlit as st
-import subprocess
-import sys
 import os
+import sys
+import time
+import threading
+import subprocess
+import streamlit as st
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scraper_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -27,37 +29,34 @@ STATE_NAMES = {
     "WI": "Wisconsin",     "WY": "Wyoming",        "DC": "District of Columbia",
 }
 
-SEASONS       = [f"{y}-{y+1}" for y in range(2029, 2019, -1)]
+SEASONS        = [f"{y}-{y+1}" for y in range(2029, 2019, -1)]
 DEFAULT_SEASON = "2025-2026"
-PHASE_LABELS  = [
+PHASE_LABELS   = [
     "Phase 1 — Fetching Schedules",
     "Phase 2 — Gap Analysis",
     "Phase 3 — Scraping Box Scores",
     "Phase 4 — Accumulating Stats",
 ]
 
-# ── Parse a log line into progress state ──────────────────────────────────────
+
+# ── Log parser ────────────────────────────────────────────────────────────────
 def parse_log(line, state):
-    # Phase 1 start
     if "Phase 1:" in line:
         state["phase"] = 1
         m = re.search(r"Fetching\s+(\d+)\s+schedules", line)
         if m:
             state["total"] = int(m.group(1))
 
-    # Phase 1 progress
     m = re.search(r"Schedules:\s*(\d+)/(\d+)", line)
     if m:
-        state["phase"]    = 1
-        state["done"]     = int(m.group(1))
-        state["total"]    = int(m.group(2))
+        state["phase"] = 1
+        state["done"]  = int(m.group(1))
+        state["total"] = int(m.group(2))
 
-    # Phase 2 start
     if "Phase 2:" in line:
         state["phase"] = 2
         state["done"]  = 0
 
-    # Phase 2 progress  [  42/ 600]  7.0% | Full:   18 | Part:    3 | TeamName
     m = re.search(r"\[\s*(\d+)/\s*(\d+)\].*Full:\s*(\d+).*Part:\s*(\d+)\s*\|\s*(.+)", line)
     if m:
         state["phase"]   = 2
@@ -67,7 +66,6 @@ def parse_log(line, state):
         state["partial"] = int(m.group(4))
         state["team"]    = m.group(5).strip()
 
-    # Phase 3 start
     if "Teams to process" in line or "Starting scraper" in line:
         state["phase"] = 3
         state["done"]  = 0
@@ -75,7 +73,6 @@ def parse_log(line, state):
         if m:
             state["total"] = int(m.group(1))
 
-    # Phase 3 progress  "Processing team 12/340: TeamName"
     m = re.search(r"Processing team\s+(\d+)/(\d+):\s*(.+)", line)
     if m:
         state["phase"] = 3
@@ -83,17 +80,14 @@ def parse_log(line, state):
         state["total"] = int(m.group(2))
         state["team"]  = m.group(3).strip()
 
-    # Phase 3 done line  "[DONE] Added 5 games for TeamName"
-    m = re.search(r"\[DONE\] Added\s+(\d+)\s+games for (.+)", line)
+    m = re.search(r"\[DONE\] Added\s+(\d+)\s+games for", line)
     if m:
         state["games"] = state.get("games", 0) + int(m.group(1))
 
-    # Phase 4 start
-    if "Running data accumulation" in line or "Accumulation complete" in line:
+    if "Running data accumulation" in line:
         state["phase"] = 4
         state["done"]  = 0
 
-    # Phase 4 progress  "Accumulating: 500/12000 games processed..."
     m = re.search(r"Accumulating:\s*(\d+)/(\d+)", line)
     if m:
         state["phase"] = 4
@@ -103,15 +97,31 @@ def parse_log(line, state):
     return state
 
 
-# ── Render the progress section ───────────────────────────────────────────────
+# ── Background thread ─────────────────────────────────────────────────────────
+def _scraper_worker(cmd, env, store):
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=env, bufsize=1,
+    )
+    store["pid"] = process.pid
+    for line in process.stdout:
+        line = line.rstrip()
+        if line:
+            store["logs"].append(line)
+            store["prog"] = parse_log(line, store["prog"])
+    process.wait()
+    store["returncode"] = process.returncode
+    store["running"]    = False
+
+
+# ── Progress renderer ─────────────────────────────────────────────────────────
 def render_progress(ph, state):
-    phase   = state["phase"]
-    done    = state["done"]
-    total   = state["total"]
-    pct     = done / total if total > 0 else 0.0
+    phase = state["phase"]
+    done  = state["done"]
+    total = state["total"]
+    pct   = done / total if total > 0 else 0.0
 
     with ph.container():
-        # Phase step indicators
         cols = st.columns(4)
         for i, (col, label) in enumerate(zip(cols, PHASE_LABELS), 1):
             if i < phase:
@@ -121,18 +131,15 @@ def render_progress(ph, state):
             else:
                 col.info(f"🔒 {label}")
 
-        # Progress bar
         if total > 0:
-            st.progress(pct, text=f"{label_for(phase)}: **{done} / {total} teams**  ({pct*100:.1f}%)")
+            st.progress(pct, text=f"{PHASE_LABELS[phase-1]}: **{done} / {total} teams** ({pct*100:.1f}%)")
         else:
-            st.progress(0.0, text=f"{label_for(phase)}: starting…")
+            st.progress(0.0, text=f"{PHASE_LABELS[phase-1] if phase <= 4 else 'Done'}: starting…")
 
-        # Current team being processed
-        current_team = state.get("team", "")
-        if current_team:
-            st.caption(f"⚙️ Currently processing: **{current_team}**")
+        team = state.get("team", "")
+        if team:
+            st.caption(f"⚙️ Currently processing: **{team}**")
 
-        # Metrics row
         if phase >= 2 and done > 0:
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Teams Done",         done)
@@ -142,13 +149,25 @@ def render_progress(ph, state):
             m5.metric("Games Scraped",      state.get("games", 0))
 
 
-def label_for(phase):
-    return PHASE_LABELS[phase - 1] if 1 <= phase <= 4 else "Starting…"
+# ── Download helper ───────────────────────────────────────────────────────────
+def show_download(placeholder, filepath, label):
+    if os.path.exists(filepath):
+        with open(filepath, "r") as f:
+            data = f.read()
+        placeholder.download_button(
+            label=f"✅ {label}",
+            data=data,
+            file_name=os.path.basename(filepath),
+            mime="application/json",
+            use_container_width=True,
+        )
+        return True
+    return False
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  UI
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAGE
+# ══════════════════════════════════════════════════════════════════════════════
 
 st.set_page_config(page_title="MaxPreps Basketball Scraper", page_icon="🏀", layout="wide")
 st.title("🏀 MaxPreps Basketball Scraper")
@@ -170,127 +189,105 @@ with st.expander("📋 How the scraper works (click to expand)", expanded=False)
 
 st.divider()
 
+# ── Dropdowns (disabled while scraping) ──────────────────────────────────────
+running = st.session_state.get("scraper", {}).get("running", False)
+
 col1, col2, col3 = st.columns(3)
 with col1:
-    state_code = st.selectbox(
-        "State",
-        options=list(STATE_NAMES.keys()),
-        format_func=lambda x: f"{x} — {STATE_NAMES[x]}"
-    )
+    state_code = st.selectbox("State", options=list(STATE_NAMES.keys()),
+                               format_func=lambda x: f"{x} — {STATE_NAMES[x]}", disabled=running)
 with col2:
-    sport = st.selectbox(
-        "Sport",
-        options=["boys", "girls"],
-        format_func=lambda x: "Boys Basketball" if x == "boys" else "Girls Basketball"
-    )
+    sport = st.selectbox("Sport", options=["boys", "girls"],
+                          format_func=lambda x: "Boys Basketball" if x == "boys" else "Girls Basketball",
+                          disabled=running)
 with col3:
-    season = st.selectbox("Season", options=SEASONS, index=SEASONS.index(DEFAULT_SEASON))
+    season = st.selectbox("Season", options=SEASONS,
+                           index=SEASONS.index(DEFAULT_SEASON), disabled=running)
 
 st.divider()
 
-if st.button("▶ Start Scraping", type="primary", use_container_width=True):
-
+# ── Start button ──────────────────────────────────────────────────────────────
+if st.button("▶ Start Scraping", type="primary", use_container_width=True, disabled=running):
     season_fn   = season.replace("-", "_")
     state_lower = state_code.lower()
-    state_name  = STATE_NAMES[state_code]
-    sport_label = "Boys" if sport == "boys" else "Girls"
 
-    st.info(f"Scraping **{state_name}** | **{sport_label} Basketball** | **{season}**")
-
-    # ── File paths ────────────────────────────────────────────────────────────
-    gaps_file = os.path.join(OUTPUT_DIR, f"{state_lower}_data_gaps_{sport}_{season_fn}.json")
-    box_file  = os.path.join(OUTPUT_DIR, f"{state_lower}_box_scores_{sport}_{season_fn}.json")
-    acc_file  = os.path.join(OUTPUT_DIR, f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json")
-
-    # ── Progress section ──────────────────────────────────────────────────────
-    st.subheader("Progress")
-    progress_ph = st.empty()
-    prog_state  = {"phase": 1, "done": 0, "total": 0, "full": 0, "partial": 0, "team": "", "games": 0}
-    render_progress(progress_ph, prog_state)
-
-    st.divider()
-
-    # ── Output files ──────────────────────────────────────────────────────────
-    st.subheader("Output Files")
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        st.markdown("**Phase 2 — Data Gaps**")
-        gaps_ph = st.empty()
-        gaps_ph.warning("⏳ Generating...")
-    with fc2:
-        st.markdown("**Phase 3 — Box Scores**")
-        box_ph = st.empty()
-        box_ph.info("🔒 Waiting for Phase 2...")
-    with fc3:
-        st.markdown("**Phase 4 — Accumulated Stats**")
-        acc_ph = st.empty()
-        acc_ph.info("🔒 Waiting for Phase 3...")
-
-    st.divider()
-
-    # ── Live logs ─────────────────────────────────────────────────────────────
-    st.subheader("Live Logs")
-    log_ph = st.empty()
-    logs   = []
-
-    gaps_ready = box_ready = acc_ready = False
+    st.session_state["scraper"] = {
+        "running":    True,
+        "returncode": None,
+        "logs":       [],
+        "prog":       {"phase": 1, "done": 0, "total": 0,
+                       "full": 0, "partial": 0, "team": "", "games": 0},
+        "gaps_file":  os.path.join(OUTPUT_DIR, f"{state_lower}_data_gaps_{sport}_{season_fn}.json"),
+        "box_file":   os.path.join(OUTPUT_DIR, f"{state_lower}_box_scores_{sport}_{season_fn}.json"),
+        "acc_file":   os.path.join(OUTPUT_DIR, f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json"),
+        "label":      f"{STATE_NAMES[state_code]} | {'Boys' if sport=='boys' else 'Girls'} Basketball | {season}",
+    }
 
     env = os.environ.copy()
     env["DATA_DIR"] = OUTPUT_DIR
 
-    process = subprocess.Popen(
-        [sys.executable, "-u", "app.py",
-         "--state", state_code, "--sport", sport, "--season", season],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        env=env,
-        bufsize=1,
+    thread = threading.Thread(
+        target=_scraper_worker,
+        args=(
+            [sys.executable, "-u", "app.py", "--state", state_code, "--sport", sport, "--season", season],
+            env,
+            st.session_state["scraper"],
+        ),
+        daemon=True,
     )
+    thread.start()
+    st.rerun()
 
-    for line in process.stdout:
-        line = line.rstrip()
-        if line:
-            # Update progress
-            prog_state = parse_log(line, prog_state)
-            render_progress(progress_ph, prog_state)
+# ── Live dashboard (shown while running or after completion) ──────────────────
+if "scraper" in st.session_state:
+    s = st.session_state["scraper"]
 
-            # Update logs
-            logs.append(line)
-            log_ph.text_area("", value="\n".join(logs[-60:]), height=300,
-                             label_visibility="collapsed")
+    st.info(f"Scraping: **{s['label']}**")
 
-        # Download buttons as files appear
-        if not gaps_ready and os.path.exists(gaps_file):
-            gaps_ready = True
-            with open(gaps_file, "r") as f:
-                gaps_ph.download_button("✅ Download Data Gaps", data=f.read(),
-                    file_name=os.path.basename(gaps_file), mime="application/json",
-                    use_container_width=True)
-            box_ph.warning("⏳ Scraping box scores...")
+    # Progress
+    st.subheader("Progress")
+    prog_ph = st.empty()
+    render_progress(prog_ph, s["prog"])
 
-        if not box_ready and os.path.exists(box_file):
-            box_ready = True
-            with open(box_file, "r") as f:
-                box_ph.download_button("✅ Download Box Scores", data=f.read(),
-                    file_name=os.path.basename(box_file), mime="application/json",
-                    use_container_width=True)
-            acc_ph.warning("⏳ Accumulating stats...")
+    st.divider()
 
-        if not acc_ready and os.path.exists(acc_file):
-            acc_ready = True
-            with open(acc_file, "r") as f:
-                acc_ph.download_button("✅ Download Accumulated Stats", data=f.read(),
-                    file_name=os.path.basename(acc_file), mime="application/json",
-                    use_container_width=True)
+    # Output files
+    st.subheader("Output Files")
+    fc1, fc2, fc3 = st.columns(3)
 
-    process.wait()
+    with fc1:
+        st.markdown("**Phase 2 — Data Gaps**")
+        gaps_ph = st.empty()
+        if not show_download(gaps_ph, s["gaps_file"], "Download Data Gaps"):
+            gaps_ph.warning("⏳ Generating...")
 
-    # Mark all phases complete
-    prog_state["phase"] = 5
-    render_progress(progress_ph, prog_state)
+    with fc2:
+        st.markdown("**Phase 3 — Box Scores**")
+        box_ph = st.empty()
+        if not show_download(box_ph, s["box_file"], "Download Box Scores"):
+            box_ph.info("🔒 Waiting...")
 
-    if process.returncode == 0:
-        st.success("🎉 Scraping completed successfully! Download your files above.")
+    with fc3:
+        st.markdown("**Phase 4 — Accumulated Stats**")
+        acc_ph = st.empty()
+        if not show_download(acc_ph, s["acc_file"], "Download Accumulated Stats"):
+            acc_ph.info("🔒 Waiting...")
+
+    st.divider()
+
+    # Live logs
+    st.subheader("Live Logs")
+    st.text_area("", value="\n".join(s["logs"][-60:]), height=300, label_visibility="collapsed")
+
+    # Status / auto-refresh
+    if s["running"]:
+        time.sleep(0.8)
+        st.rerun()
     else:
-        st.error("Scraping failed. Check the logs above for details.")
+        if s["returncode"] == 0:
+            st.success("🎉 Scraping completed! Download your files above.")
+        else:
+            st.error("Scraping failed. Check the logs above.")
+        if st.button("🔄 Start New Scrape", use_container_width=True):
+            del st.session_state["scraper"]
+            st.rerun()

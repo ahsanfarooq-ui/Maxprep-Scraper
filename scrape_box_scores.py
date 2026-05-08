@@ -450,8 +450,8 @@ def _save(games, errors, total_teams, output_file, processed_teams=None):
         },
         "games": games,
     }
-    with open(output_file, "w") as f:
-        json.dump(out, f, indent=2)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
 
 
 # ── Core scraping logic (callable from gap finder or standalone) ──────────────
@@ -467,7 +467,7 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
         output_file = OUTPUT_FILE
 
     # ── Load input ───────────────────────────────────────────────────────────
-    with open(input_file) as f:
+    with open(input_file, encoding="utf-8") as f:
         gaps = json.load(f)
 
     teams = (
@@ -489,7 +489,7 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
     # ── Resume Logic ─────────────────────────────────────────────────────────
     if os.path.exists(output_file):
         try:
-            with open(output_file, "r") as f:
+            with open(output_file, "r", encoding="utf-8") as f:
                 existing_data = json.load(f)
                 all_games = existing_data.get("games", [])
                 errors = existing_data.get("meta", {}).get("errors", [])

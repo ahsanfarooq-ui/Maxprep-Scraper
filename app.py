@@ -1,3 +1,4 @@
+
 """
 HS Basketball — Box Score Gap Finder (High Speed Parallel Version)
 ==================================================================
@@ -214,8 +215,8 @@ def _save_gaps(output_file, state_name, state_code, total_count, full_data, part
         "teamsNoBoxScores": sorted(no_data, key=lambda x: x["teamName"]),
         "errors": errors,
     }
-    with open(output_file, "w") as f:
-        json.dump(output, f, indent=2)
+    with open(output_file, "w", encoding="utf-8") as f:
+        json.dump(output, f, indent=2, ensure_ascii=False)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -259,7 +260,7 @@ def main():
     season_fn = args.season.replace("-", "_")
     output_file = os.path.join(DATA_DIR, f"{state_lower}_data_gaps_{sport_label}_{season_fn}.json")
     
-    with open(input_file) as f: data = json.load(f)
+    with open(input_file, encoding="utf-8") as f: data = json.load(f)
     if state_code not in data.get("byState", {}):
         print(f"Error: State {state_code} not found."); sys.exit(1)
 
@@ -272,7 +273,7 @@ def main():
     full_data, partial_data, no_data, errors, processed_teams = [], [], [], [], set()
     if os.path.exists(output_file):
         try:
-            with open(output_file, "r") as f:
+            with open(output_file, "r", encoding="utf-8") as f:
                 existing = json.load(f)
                 full_data = existing.get("teamsFullBoxScores", [])
                 partial_data = existing.get("teamsPartialBoxScores", [])
