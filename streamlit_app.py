@@ -152,7 +152,7 @@ def render_progress(ph, state):
 # ── Download helper ───────────────────────────────────────────────────────────
 def show_download(placeholder, filepath, label):
     if os.path.exists(filepath):
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             data = f.read()
         placeholder.download_button(
             label=f"✅ {label}",
@@ -206,10 +206,24 @@ with col3:
 
 st.divider()
 
+# ── Clear previous data option ────────────────────────────────────────────────
+clear_previous = st.checkbox("🗑️ Clear previous data for this state/sport/season before starting", value=False, disabled=running)
+
 # ── Start button ──────────────────────────────────────────────────────────────
 if st.button("▶ Start Scraping", type="primary", use_container_width=True, disabled=running):
     season_fn   = season.replace("-", "_")
     state_lower = state_code.lower()
+
+    # Delete old files if requested
+    if clear_previous:
+        for fname in [
+            f"{state_lower}_data_gaps_{sport}_{season_fn}.json",
+            f"{state_lower}_box_scores_{sport}_{season_fn}.json",
+            f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json",
+        ]:
+            fpath = os.path.join(OUTPUT_DIR, fname)
+            if os.path.exists(fpath):
+                os.remove(fpath)
 
     st.session_state["scraper"] = {
         "running":    True,
