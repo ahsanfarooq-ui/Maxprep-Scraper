@@ -11,4 +11,4 @@ RUN mkdir -p /data
 
 ENV DATA_DIR=/data
 
-CMD python texas_data_gap_finder.py --state ${STATE} --sport ${SPORT} --season ${SEASON}
+CMD ["sh", "-c", "python texas_data_gap_finder.py --state $STATE --sport $SPORT --season $SEASON"]
