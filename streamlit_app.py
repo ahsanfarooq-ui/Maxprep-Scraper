@@ -1,13 +1,17 @@
 import re
 import os
 import sys
+import json
 import time
-import threading
 import subprocess
 import streamlit as st
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scraper_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Disk-persisted state files (survive browser disconnect / screen sleep)
+STATE_FILE = os.path.join(OUTPUT_DIR, ".scraper_state.json")
+LOG_FILE   = os.path.join(OUTPUT_DIR, ".scraper.log")
 
 STATE_NAMES = {
     "AL": "Alabama",       "AK": "Alaska",         "AZ": "Arizona",
@@ -97,21 +101,60 @@ def parse_log(line, state):
     return state
 
 
-# ── Background thread ─────────────────────────────────────────────────────────
-def _scraper_worker(cmd, env, store):
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, env=env, bufsize=1,
-    )
-    store["pid"] = process.pid
-    for line in process.stdout:
-        line = line.rstrip()
-        if line:
-            store["logs"].append(line)
-            store["prog"] = parse_log(line, store["prog"])
-    process.wait()
-    store["returncode"] = process.returncode
-    store["running"]    = False
+# ── Disk state helpers ────────────────────────────────────────────────────────
+def load_disk_state():
+    if not os.path.exists(STATE_FILE):
+        return None
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+def save_disk_state(d):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(d, f)
+
+def clear_disk_state():
+    for p in [STATE_FILE, LOG_FILE]:
+        try:
+            os.remove(p)
+        except FileNotFoundError:
+            pass
+
+def is_pid_running(pid):
+    if pid is None:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except PermissionError:
+        return True   # process exists, no permission to signal — still running
+    except Exception:
+        return False
+
+def tail_log(n=60):
+    if not os.path.exists(LOG_FILE):
+        return ""
+    try:
+        with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        return "\n".join(l.rstrip() for l in lines[-n:] if l.strip())
+    except Exception:
+        return ""
+
+def parse_progress_from_log():
+    prog = {"phase": 1, "done": 0, "total": 0,
+            "full": 0, "partial": 0, "team": "", "games": 0}
+    if not os.path.exists(LOG_FILE):
+        return prog
+    try:
+        with open(LOG_FILE, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                prog = parse_log(line.rstrip(), prog)
+    except Exception:
+        pass
+    return prog
 
 
 # ── Progress renderer ─────────────────────────────────────────────────────────
@@ -189,9 +232,11 @@ with st.expander("📋 How the scraper works (click to expand)", expanded=False)
 
 st.divider()
 
-# ── Dropdowns (disabled while scraping) ──────────────────────────────────────
-running = st.session_state.get("scraper", {}).get("running", False)
+# ── Read persisted state from disk (survives screen sleep / browser reconnect) ─
+disk = load_disk_state()
+running = disk is not None and is_pid_running(disk.get("pid"))
 
+# ── Dropdowns (disabled while scraping) ──────────────────────────────────────
 col1, col2, col3 = st.columns(3)
 with col1:
     state_code = st.selectbox("State", options=list(STATE_NAMES.keys()),
@@ -207,14 +252,16 @@ with col3:
 st.divider()
 
 # ── Clear previous data option ────────────────────────────────────────────────
-clear_previous = st.checkbox("🗑️ Clear previous data for this state/sport/season before starting", value=False, disabled=running)
+clear_previous = st.checkbox("🗑️ Clear previous data for this state/sport/season before starting",
+                              value=False, disabled=running)
 
 # ── Start button ──────────────────────────────────────────────────────────────
 if st.button("▶ Start Scraping", type="primary", use_container_width=True, disabled=running):
     season_fn   = season.replace("-", "_")
     state_lower = state_code.lower()
 
-    # Delete old files if requested
+    clear_disk_state()
+
     if clear_previous:
         for fname in [
             f"{state_lower}_data_gaps_{sport}_{season_fn}.json",
@@ -225,83 +272,80 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
             if os.path.exists(fpath):
                 os.remove(fpath)
 
-    st.session_state["scraper"] = {
-        "running":    True,
-        "returncode": None,
-        "logs":       [],
-        "prog":       {"phase": 1, "done": 0, "total": 0,
-                       "full": 0, "partial": 0, "team": "", "games": 0},
-        "gaps_file":  os.path.join(OUTPUT_DIR, f"{state_lower}_data_gaps_{sport}_{season_fn}.json"),
-        "box_file":   os.path.join(OUTPUT_DIR, f"{state_lower}_box_scores_{sport}_{season_fn}.json"),
-        "acc_file":   os.path.join(OUTPUT_DIR, f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json"),
-        "label":      f"{STATE_NAMES[state_code]} | {'Boys' if sport=='boys' else 'Girls'} Basketball | {season}",
-    }
-
     env = os.environ.copy()
-    env["DATA_DIR"] = OUTPUT_DIR
+    env["DATA_DIR"]         = OUTPUT_DIR
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"]       = "1"
 
-    thread = threading.Thread(
-        target=_scraper_worker,
-        args=(
-            [sys.executable, "-u", "app.py", "--state", state_code, "--sport", sport, "--season", season],
-            env,
-            st.session_state["scraper"],
-        ),
-        daemon=True,
+    # Open log file in binary mode — subprocess writes UTF-8 bytes directly
+    log_f = open(LOG_FILE, "wb")
+    process = subprocess.Popen(
+        [sys.executable, "-u", "app.py",
+         "--state", state_code, "--sport", sport, "--season", season],
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=True,   # detach: survives browser disconnect
     )
-    thread.start()
+    log_f.close()   # parent closes its copy; subprocess keeps writing
+
+    save_disk_state({
+        "pid":       process.pid,
+        "label":     f"{STATE_NAMES[state_code]} | {'Boys' if sport=='boys' else 'Girls'} Basketball | {season}",
+        "gaps_file": os.path.join(OUTPUT_DIR, f"{state_lower}_data_gaps_{sport}_{season_fn}.json"),
+        "box_file":  os.path.join(OUTPUT_DIR, f"{state_lower}_box_scores_{sport}_{season_fn}.json"),
+        "acc_file":  os.path.join(OUTPUT_DIR, f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json"),
+    })
     st.rerun()
 
-# ── Live dashboard (shown while running or after completion) ──────────────────
-if "scraper" in st.session_state:
-    s = st.session_state["scraper"]
+# ── Live dashboard ────────────────────────────────────────────────────────────
+if disk is not None:
+    prog = parse_progress_from_log()
+    logs = tail_log()
 
-    st.info(f"Scraping: **{s['label']}**")
+    st.info(f"Scraping: **{disk['label']}**")
 
-    # Progress
     st.subheader("Progress")
     prog_ph = st.empty()
-    render_progress(prog_ph, s["prog"])
+    render_progress(prog_ph, prog)
 
     st.divider()
 
-    # Output files
     st.subheader("Output Files")
     fc1, fc2, fc3 = st.columns(3)
 
     with fc1:
         st.markdown("**Phase 2 — Data Gaps**")
         gaps_ph = st.empty()
-        if not show_download(gaps_ph, s["gaps_file"], "Download Data Gaps"):
+        if not show_download(gaps_ph, disk["gaps_file"], "Download Data Gaps"):
             gaps_ph.warning("⏳ Generating...")
 
     with fc2:
         st.markdown("**Phase 3 — Box Scores**")
         box_ph = st.empty()
-        if not show_download(box_ph, s["box_file"], "Download Box Scores"):
+        if not show_download(box_ph, disk["box_file"], "Download Box Scores"):
             box_ph.info("🔒 Waiting...")
 
     with fc3:
         st.markdown("**Phase 4 — Accumulated Stats**")
         acc_ph = st.empty()
-        if not show_download(acc_ph, s["acc_file"], "Download Accumulated Stats"):
+        if not show_download(acc_ph, disk["acc_file"], "Download Accumulated Stats"):
             acc_ph.info("🔒 Waiting...")
 
     st.divider()
 
-    # Live logs
     st.subheader("Live Logs")
-    st.text_area("", value="\n".join(s["logs"][-60:]), height=300, label_visibility="collapsed")
+    st.text_area("", value=logs, height=300, label_visibility="collapsed")
 
-    # Status / auto-refresh
-    if s["running"]:
-        time.sleep(0.8)
+    if running:
+        time.sleep(1.5)
         st.rerun()
     else:
-        if s["returncode"] == 0:
+        if os.path.exists(disk["acc_file"]):
             st.success("🎉 Scraping completed! Download your files above.")
         else:
-            st.error("Scraping failed. Check the logs above.")
+            st.error("Scraping stopped or failed. Check the logs above.")
+
         if st.button("🔄 Start New Scrape", use_container_width=True):
-            del st.session_state["scraper"]
+            clear_disk_state()
             st.rerun()
