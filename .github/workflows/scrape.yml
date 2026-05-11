@@ -1,0 +1,58 @@
+name: Run MaxPreps Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      state:
+        description: "State code (e.g. NM, TX, CA)"
+        required: true
+        default: "NM"
+      sport:
+        description: "Sport"
+        required: true
+        default: "boys"
+        type: choice
+        options:
+          - boys
+          - girls
+      season:
+        description: "Season (e.g. 2025-2026)"
+        required: true
+        default: "2025-2026"
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4 lxml urllib3
+
+      - name: Run scraper
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
+          DATA_DIR: ${{ github.workspace }}/scraper_output
+        run: |
+          mkdir -p scraper_output
+          python app.py \
+            --state ${{ github.event.inputs.state }} \
+            --sport ${{ github.event.inputs.sport }} \
+            --season ${{ github.event.inputs.season }}
+
+      - name: Upload output files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scraper-output-${{ github.event.inputs.state }}-${{ github.event.inputs.sport }}-${{ github.event.inputs.season }}
+          path: scraper_output/
+          retention-days: 7
