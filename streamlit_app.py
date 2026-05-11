@@ -9,7 +9,6 @@ import streamlit as st
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scraper_output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Disk-persisted state files (survive browser disconnect / screen sleep)
 STATE_FILE = os.path.join(OUTPUT_DIR, ".scraper_state.json")
 LOG_FILE   = os.path.join(OUTPUT_DIR, ".scraper.log")
 
@@ -123,13 +122,19 @@ def clear_disk_state():
             pass
 
 def is_pid_running(pid):
+    """Reliable cross-platform PID check. Uses /proc on Linux (Streamlit Cloud)."""
     if pid is None:
         return False
     try:
-        os.kill(int(pid), 0)
+        pid = int(pid)
+        # Linux (Streamlit Cloud): /proc/<pid> disappears the moment process dies
+        if os.path.exists(f"/proc/{pid}"):
+            return True
+        # Windows / macOS fallback
+        os.kill(pid, 0)
         return True
     except PermissionError:
-        return True   # process exists, no permission to signal — still running
+        return True   # process exists but we can't signal it
     except Exception:
         return False
 
@@ -232,11 +237,11 @@ with st.expander("📋 How the scraper works (click to expand)", expanded=False)
 
 st.divider()
 
-# ── Read persisted state from disk (survives screen sleep / browser reconnect) ─
-disk = load_disk_state()
+# ── Load persisted state ──────────────────────────────────────────────────────
+disk    = load_disk_state()
 running = disk is not None and is_pid_running(disk.get("pid"))
 
-# ── Dropdowns (disabled while scraping) ──────────────────────────────────────
+# ── Dropdowns — only disabled while actively running ─────────────────────────
 col1, col2, col3 = st.columns(3)
 with col1:
     state_code = st.selectbox("State", options=list(STATE_NAMES.keys()),
@@ -251,16 +256,15 @@ with col3:
 
 st.divider()
 
-# ── Clear previous data option ────────────────────────────────────────────────
 clear_previous = st.checkbox("🗑️ Clear previous data for this state/sport/season before starting",
                               value=False, disabled=running)
 
-# ── Start button ──────────────────────────────────────────────────────────────
+# ── Start button — enabled whenever scraper is not actively running ───────────
 if st.button("▶ Start Scraping", type="primary", use_container_width=True, disabled=running):
     season_fn   = season.replace("-", "_")
     state_lower = state_code.lower()
 
-    clear_disk_state()
+    clear_disk_state()   # always wipe old log/state before new run
 
     if clear_previous:
         for fname in [
@@ -277,7 +281,6 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"]       = "1"
 
-    # Open log file in binary mode — subprocess writes UTF-8 bytes directly
     log_f = open(LOG_FILE, "wb")
     process = subprocess.Popen(
         [sys.executable, "-u", "app.py",
@@ -285,9 +288,9 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
         stdout=log_f,
         stderr=subprocess.STDOUT,
         env=env,
-        start_new_session=True,   # detach: survives browser disconnect
+        start_new_session=True,
     )
-    log_f.close()   # parent closes its copy; subprocess keeps writing
+    log_f.close()
 
     save_disk_state({
         "pid":       process.pid,
@@ -298,19 +301,26 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
     })
     st.rerun()
 
-# ── Live dashboard ────────────────────────────────────────────────────────────
+# ── Dashboard: shown while running OR after completion ────────────────────────
 if disk is not None:
-    prog = parse_progress_from_log()
-    logs = tail_log()
+    st.divider()
 
-    st.info(f"Scraping: **{disk['label']}**")
+    if running:
+        st.info(f"⏳ Scraping in progress: **{disk['label']}**")
+    else:
+        if os.path.exists(disk.get("acc_file", "")):
+            st.success(f"🎉 Completed: **{disk['label']}** — Download your files below, then start a new scrape above.")
+        else:
+            st.warning(f"⚠️ Stopped/failed: **{disk['label']}** — Check logs below. You can start a new scrape above.")
 
-    st.subheader("Progress")
+    # Progress
+    prog    = parse_progress_from_log()
     prog_ph = st.empty()
     render_progress(prog_ph, prog)
 
     st.divider()
 
+    # Output files
     st.subheader("Output Files")
     fc1, fc2, fc3 = st.columns(3)
 
@@ -332,20 +342,11 @@ if disk is not None:
         if not show_download(acc_ph, disk["acc_file"], "Download Accumulated Stats"):
             acc_ph.info("🔒 Waiting...")
 
-    st.divider()
+    # Logs
+    with st.expander("📄 Logs", expanded=running):
+        st.text_area("", value=tail_log(), height=300, label_visibility="collapsed")
 
-    st.subheader("Live Logs")
-    st.text_area("", value=logs, height=300, label_visibility="collapsed")
-
+    # Auto-refresh while running
     if running:
         time.sleep(1.5)
         st.rerun()
-    else:
-        if os.path.exists(disk["acc_file"]):
-            st.success("🎉 Scraping completed! Download your files above.")
-        else:
-            st.error("Scraping stopped or failed. Check the logs above.")
-
-        if st.button("🔄 Start New Scrape", use_container_width=True):
-            clear_disk_state()
-            st.rerun()
