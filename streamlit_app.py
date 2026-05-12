@@ -346,6 +346,14 @@ if disk is not None:
     with st.expander("📄 Logs", expanded=running):
         st.text_area("", value=tail_log(), height=300, label_visibility="collapsed")
 
+    # After completion — show reset button
+    if not running:
+        st.divider()
+        if st.button("🔄 Scrape Another State / Sport / Season",
+                     type="primary", use_container_width=True):
+            clear_disk_state()
+            st.rerun()
+
     # Auto-refresh while running
     if running:
         time.sleep(1.5)
