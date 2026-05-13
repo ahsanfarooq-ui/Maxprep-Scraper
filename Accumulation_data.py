@@ -36,6 +36,33 @@ def process_stats(input_file=None, output_file=None):
     # Handle both flat list and wrapped {"meta": ..., "games": [...]} format
     data = raw.get("games", raw) if isinstance(raw, dict) else raw
 
+    # Pass 1: determine each player's primary team (the team they appear under most often).
+    # This guards against scraper bugs where a player's stats land in the wrong team section.
+    print("  Pass 1: building player->primary-team map...")
+    player_team_game_count = defaultdict(lambda: defaultdict(int))
+    for game in data:
+        if game.get('is_deleted'):
+            continue
+        t_id = game.get('team', {}).get('team_id', '')
+        if not t_id:
+            continue
+        game_players = set()
+        for section in ('shooting', 'detailed_shooting', 'totals', 'misc'):
+            for p in game.get(section, {}).get('team', {}).get('players', []):
+                p_name = f"{p['player_name']}({p.get('class', '')})"
+                game_players.add(p_name)
+        for p_name in game_players:
+            player_team_game_count[p_name][t_id] += 1
+
+    player_primary_team = {
+        p_name: max(counts, key=counts.get)
+        for p_name, counts in player_team_game_count.items()
+    }
+    print(f"  Pass 1 complete. {len(player_primary_team)} unique players mapped.")
+
+    # Pass 2: accumulate stats, skipping any player whose primary team differs
+    # from the team currently being processed (eliminates cross-team ghost records).
+
     # team_stats[team_id] = { player_name: { stats } }
     # Plus a special key "Season Totals"
     all_teams_data = {}
@@ -89,11 +116,18 @@ def process_stats(input_file=None, output_file=None):
                 'TO': 0.0, 'PF': 0.0, 'Chr': 0.0, 'Defl': 0.0, 'TF': 0.0
             })
 
+            def _is_primary(p_name):
+                """Return True only if this player's primary team is the current team."""
+                primary = player_primary_team.get(p_name)
+                return primary is None or primary == t_id
+
             # 1. Shooting stats
             shooting_side = game.get('shooting', {}).get(side_key, {})
             if shooting_side and shooting_side.get('players'):
                 for p in shooting_side['players']:
                     p_name = f"{p['player_name']}({p.get('class', '')})"
+                    if not _is_primary(p_name):
+                        continue
                     stats = game_players_stats[p_name]
                     stats['Min'] += safe_float(p.get('minutes_played'))
                     stats['Pts'] += safe_float(p.get('points'))
@@ -105,6 +139,8 @@ def process_stats(input_file=None, output_file=None):
             if detailed_side and detailed_side.get('players'):
                 for p in detailed_side['players']:
                     p_name = f"{p['player_name']}({p.get('class', '')})"
+                    if not _is_primary(p_name):
+                        continue
                     stats = game_players_stats[p_name]
                     stats['3PM'] += safe_float(p.get('3pt_made'))
                     stats['3PA'] += safe_float(p.get('3pt_attempts'))
@@ -118,6 +154,8 @@ def process_stats(input_file=None, output_file=None):
             if totals_side and totals_side.get('players'):
                 for p in totals_side['players']:
                     p_name = f"{p['player_name']}({p.get('class', '')})"
+                    if not _is_primary(p_name):
+                        continue
                     stats = game_players_stats[p_name]
                     stats['OReb'] += safe_float(p.get('offensive_rebounds'))
                     stats['DReb'] += safe_float(p.get('defensive_rebounds'))
@@ -133,6 +171,8 @@ def process_stats(input_file=None, output_file=None):
             if misc_side and misc_side.get('players'):
                 for p in misc_side['players']:
                     p_name = f"{p['player_name']}({p.get('class', '')})"
+                    if not _is_primary(p_name):
+                        continue
                     stats = game_players_stats[p_name]
                     stats['Chr'] += safe_float(p.get('charges_taken'))
                     stats['Defl'] += safe_float(p.get('deflections'))
@@ -160,7 +200,6 @@ def process_stats(input_file=None, output_file=None):
                     season_t['TD'] += 1
 
         process_side('team', game.get('team'))
-        process_side('opponent', game.get('opponent'))
 
     # Final calculation and formatting
     final_output_list = []
