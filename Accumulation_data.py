@@ -71,23 +71,41 @@ def process_stats(input_file=None, output_file=None):
     else:
         print("  Master name lookup not found — team names will use box score values.")
 
-    # Pass 1: determine each player's primary team (the team they appear under most often).
-    # This guards against scraper bugs where a player's stats land in the wrong team section.
+    # A "scraped" team has a full canonical path ID (e.g. tx/city/team/basketball/sport).
+    # An unscraped team only appears as an opponent and gets a short normalised ID (e.g. "westwood").
+    # We use slash-count to distinguish them.
+    def _is_scraped(team_id):
+        return team_id.count('/') >= 3
+
+    # Pass 1: determine each player's primary team.
+    # - Count team-side appearances for all teams (scraped and unscraped).
+    # - Also count opponent-side appearances but ONLY for unscraped teams, so players
+    #   whose real team was never scraped still get correctly assigned.
     print("  Pass 1: building player->primary-team map...")
     player_team_game_count = defaultdict(lambda: defaultdict(int))
     for game in data:
         if game.get('is_deleted'):
             continue
+        # Team side
         t_id = game.get('team', {}).get('team_id', '')
-        if not t_id:
-            continue
-        game_players = set()
-        for section in ('shooting', 'detailed_shooting', 'totals', 'misc'):
-            for p in game.get(section, {}).get('team', {}).get('players', []):
-                p_name = f"{p['player_name']}({p.get('class', '')})"
-                game_players.add(p_name)
-        for p_name in game_players:
-            player_team_game_count[p_name][t_id] += 1
+        if t_id:
+            game_players = set()
+            for section in ('shooting', 'detailed_shooting', 'totals', 'misc'):
+                for p in game.get(section, {}).get('team', {}).get('players', []):
+                    p_name = f"{p['player_name']}({p.get('class', '')})"
+                    game_players.add(p_name)
+            for p_name in game_players:
+                player_team_game_count[p_name][t_id] += 1
+        # Opponent side — only for unscraped teams
+        o_id = game.get('opponent', {}).get('team_id', '')
+        if o_id and not _is_scraped(o_id):
+            opp_players = set()
+            for section in ('shooting', 'detailed_shooting', 'totals', 'misc'):
+                for p in game.get(section, {}).get('opponent', {}).get('players', []):
+                    p_name = f"{p['player_name']}({p.get('class', '')})"
+                    opp_players.add(p_name)
+            for p_name in opp_players:
+                player_team_game_count[p_name][o_id] += 1
 
     player_primary_team = {
         p_name: max(counts, key=counts.get)
@@ -236,6 +254,11 @@ def process_stats(input_file=None, output_file=None):
                     season_t['TD'] += 1
 
         process_side('team', game.get('team'))
+        # Process opponent side only for unscraped teams (short IDs like "westwood").
+        # Scraped teams get their stats exclusively from their own game records.
+        opp_info = game.get('opponent', {})
+        if opp_info and not _is_scraped(opp_info.get('team_id', '')):
+            process_side('opponent', opp_info)
 
     # Final calculation and formatting
     final_output_list = []
