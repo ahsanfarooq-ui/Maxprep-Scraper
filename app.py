@@ -10,7 +10,7 @@ Expected runtime for 1800+ teams: ~30–45 minutes (vs 7 hours).
 
 HOW TO USE:::::===========================================================
 python app.py --state TX --sport girls --season 2025-2026
-python app.py --state TX --sport boys --season 2025-2026
+python app.py --state NM --sport boys --season 2025-2026
 ==========================================================================
 """
 
@@ -113,6 +113,10 @@ def refresh_build_id(old_version):
 
 def team_url_to_path(team_url):
     return re.sub(r"https://www\.maxpreps\.com/", "", team_url).rstrip("/")
+
+def clean_team_name(name):
+    """Fix known URL-encoding corruptions in team names from the master list."""
+    return name.replace("Aandm", "A&M").replace("aandm", "a&m")
 
 def decode_contest_guid(c_param):
     try:
@@ -265,7 +269,7 @@ def main():
         print(f"Error: State {state_code} not found."); sys.exit(1)
 
     state_regions = data["byState"][state_code]["regions"]
-    all_teams = [{"teamName": t["teamName"], "teamUrl": t["teamUrl"], "region": r}
+    all_teams = [{"teamName": clean_team_name(t["teamName"]), "teamUrl": t["teamUrl"], "region": r}
                  for r, d in state_regions.items() for t in d["teams"]]
     total = len(all_teams)
 

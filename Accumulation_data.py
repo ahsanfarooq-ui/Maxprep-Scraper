@@ -1,6 +1,34 @@
 import json
 import os
+import glob
 from collections import defaultdict
+
+
+def _build_master_name_lookup():
+    """
+    Build team_id -> full team name from all master list JSON files found
+    next to this script. Used to ensure accumulated stats always carry the
+    correct full name (e.g. 'Boerne Greyhounds') regardless of what the
+    gaps file or box scores stored.
+    """
+    lookup = {}
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    for master_file in glob.glob(os.path.join(script_dir, '*basketball_all_states*.json')):
+        try:
+            with open(master_file, encoding='utf-8') as f:
+                data = json.load(f)
+            for state_data in data.get('byState', {}).values():
+                for region_data in state_data.get('regions', {}).values():
+                    for t in region_data.get('teams', []):
+                        url = t.get('teamUrl', '')
+                        tid = url.replace('https://www.maxpreps.com/', '').rstrip('/')
+                        name = t.get('teamName', '')
+                        if tid and name:
+                            name = name.replace('Aandm', 'A&M').replace('aandm', 'a&m')
+                            lookup[tid] = name
+        except Exception:
+            pass
+    return lookup
 
 def safe_float(value):
     try:
@@ -35,6 +63,13 @@ def process_stats(input_file=None, output_file=None):
 
     # Handle both flat list and wrapped {"meta": ..., "games": [...]} format
     data = raw.get("games", raw) if isinstance(raw, dict) else raw
+
+    # Load master name lookup — full team names from boys/girls_basketball_all_states.json
+    master_names = _build_master_name_lookup()
+    if master_names:
+        print(f"  Master name lookup loaded: {len(master_names)} teams.")
+    else:
+        print("  Master name lookup not found — team names will use box score values.")
 
     # Pass 1: determine each player's primary team (the team they appear under most often).
     # This guards against scraper bugs where a player's stats land in the wrong team section.
@@ -84,7 +119,8 @@ def process_stats(input_file=None, output_file=None):
                 return
             
             t_id = team_info['team_id']
-            t_name = team_info['team_name']
+            # Use master list full name if available, fall back to box score name
+            t_name = master_names.get(t_id) or team_info['team_name']
 
             if t_id not in all_teams_data:
                 all_teams_data[t_id] = {
