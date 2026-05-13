@@ -297,7 +297,9 @@ def main():
             futures = {pool.submit(fetch_sched_worker, t): t for t in teams_to_process}
             for i, fut in enumerate(as_completed(futures), 1):
                 team, entries = fut.result()
-                sched_results[team["teamName"]] = (team, entries)
+                # Key by teamUrl (unique) not teamName — duplicate names would silently
+                # overwrite each other causing teams to be skipped entirely.
+                sched_results[team["teamUrl"]] = (team, entries)
                 if i % 100 == 0 or i == len(teams_to_process):
                     print(f"  Schedules: {i}/{len(teams_to_process)} done")
 
@@ -305,7 +307,7 @@ def main():
         print(f"Phase 2: Checking games in parallel ({GAME_WORKERS} workers)...")
         agg_lock = threading.Lock()
         game_jobs = []
-        for tname, (team, entries) in sched_results.items():
+        for turl, (team, entries) in sched_results.items():
             if entries is None:
                 errors.append({"teamName": team["teamName"], "teamUrl": team["teamUrl"], "region": team["region"]})
                 processed_teams.add(team_url_to_path(team["teamUrl"]))

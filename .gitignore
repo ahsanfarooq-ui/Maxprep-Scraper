@@ -1,3 +1,6 @@
+# Claude Code editor files
+.claude/
+
 # Python cache
 __pycache__/
 *.pyc
