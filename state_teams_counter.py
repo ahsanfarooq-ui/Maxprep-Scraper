@@ -208,14 +208,22 @@ def get_all_teams_for_state(build_id: str, state: str, season: Optional[str] = N
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(get_teams_from_leaf, build_id, leaf): leaf for leaf in unique_leaves}
         for future in concurrent.futures.as_completed(futures):
-            teams_from_leaf = future.result()
+            try:
+                teams_from_leaf = future.result()
+            except Exception as e:
+                leaf = futures[future]
+                print(f"  [WARN] leaf {leaf} failed: {e}")
+                continue
             for t in teams_from_leaf:
-                uid = t["schoolId"] or t["teamName"]
+                # Prefer teamUrl as the dedup key — it's unique per real-world team.
+                # schoolId may be missing for some entries, and teamName collides
+                # (e.g. multiple 'Heritage Christian Eagles' across TX districts).
+                uid = t.get("teamUrl") or t.get("schoolId") or t.get("teamName")
                 if uid not in seen_ids:
                     seen_ids.add(uid)
                     all_teams.append(t)
                     print(f"      [Scraped Team] {t['teamName']} ({t['league']})")
-                    
+
     return all_teams
 
 def run(sport="boys", season=None, states=None):
@@ -275,10 +283,13 @@ def run(sport="boys", season=None, states=None):
             }
             print(f"  [{state.upper()}] {total} teams")
             
-        # Save at runtime after every state finishes so progress is never lost
+        # Save at runtime after every state finishes so progress is never lost.
+        # Atomic write avoids corrupting the file on Ctrl+C / power loss.
         grand_total = sum(v.get("totalTeams", 0) for v in results.values())
         output = {"meta": {"sport": sport_label, "grandTotal": grand_total}, "byState": results}
-        with open(out_file, "w") as f: json.dump(output, f, indent=2)
+        tmp = out_file + ".tmp"
+        with open(tmp, "w") as f: json.dump(output, f, indent=2)
+        os.replace(tmp, out_file)
 
     print(f"Finished. Saved → {out_file}")
     return out_file

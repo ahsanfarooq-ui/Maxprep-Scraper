@@ -472,8 +472,23 @@ def _save(games, errors, total_teams, output_file, processed_teams=None):
         },
         "games": games,
     }
-    with open(output_file, "w", encoding="utf-8") as f:
+    # Atomic write: avoid leaving a half-written file if interrupted mid-save.
+    tmp = output_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, output_file)
+
+
+def _name_from_url(team_url, fallback=""):
+    """Derive full team name (e.g. 'Avinger Indians') from the URL slug — see
+    matching helper in app.py. Page parser needs the full name to match the
+    team header on the box score."""
+    m = re.match(r"https?://(?:www\.)?maxpreps\.com/([^/]+)/([^/]+)/([^/]+)/", team_url)
+    if m:
+        slug = m.group(3).replace("-", " ").title()
+        if slug:
+            return slug.replace("Aandm", "A&M").replace("aandm", "a&m")
+    return fallback
 
 
 # ── Core scraping logic (callable from gap finder or standalone) ──────────────
@@ -521,9 +536,12 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
             print(f"Could not load existing output file for resumption: {e}")
 
     for t_idx, team in enumerate(teams, 1):
-        team_name = team["teamName"]
         team_url  = team["teamUrl"]
         team_id   = team_url_to_path(team_url)
+        # Derive team_name from URL slug rather than trusting the gaps file —
+        # stale stored names (e.g. 'Avinger' instead of 'Avinger Indians') break
+        # the box-score page parser's team-header match.
+        team_name = _name_from_url(team_url, team.get("teamName", ""))
 
         if team_id in processed_teams:
             # Skip already processed teams
@@ -531,9 +549,12 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
 
         print(f"\nProcessing team {t_idx}/{total_teams}: {team_name}")
 
-        # ── Schedule (with retry logic) ──────────────────────────────────────
+        # ── Schedule (with bounded retry logic — must not loop forever) ──────
         contests = None
         bid_retries = 0
+        none_retries = 0
+        net_retries = 0
+        gave_up = False
         while contests is None:
             try:
                 path = team_url_to_path(team_url)
@@ -553,18 +574,36 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
                     continue
 
                 if contests is None:
-                    print(f"  [WARN] Schedule fetch returned None for {team_name}. Retrying in 5s...")
+                    none_retries += 1
+                    if none_retries > 5:
+                        print(f"  [WARN] Schedule fetch keeps returning None for {team_name}. Recording error and skipping.")
+                        errors.append({"teamName": team_name, "teamUrl": team_url, "stage": "schedule"})
+                        gave_up = True
+                        break
+                    print(f"  [WARN] Schedule fetch returned None for {team_name}. Retry {none_retries}/5 in 5s...")
                     time.sleep(5)
                     continue
 
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                print(f"  [ERROR] Network issue: {e}. Retrying in 30s...")
+                net_retries += 1
+                if net_retries > 5:
+                    print(f"  [ERROR] Network issue persists for {team_name}: {e}. Recording error and skipping.")
+                    errors.append({"teamName": team_name, "teamUrl": team_url, "stage": "schedule", "error": str(e)})
+                    gave_up = True
+                    break
+                print(f"  [ERROR] Network issue: {e}. Retry {net_retries}/5 in 30s...")
                 time.sleep(30)
                 continue
             except Exception as e:
-                print(f"  [ERROR] Unexpected error fetching schedule: {e}. Retrying in 10s...")
-                time.sleep(10)
-                continue
+                print(f"  [ERROR] Unexpected error fetching schedule for {team_name}: {e}. Recording error and skipping.")
+                errors.append({"teamName": team_name, "teamUrl": team_url, "stage": "schedule", "error": str(e)})
+                gave_up = True
+                break
+
+        if gave_up:
+            # Don't mark the team as processed — so a future run can retry it.
+            _save(all_games, errors, total_teams, output_file, processed_teams)
+            continue
 
         entries = get_game_entries(contests)
         team_games_count = 0
@@ -600,7 +639,20 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
         _save(all_games, errors, total_teams, output_file, processed_teams)
 
     # ── Final save ────────────────────────────────────────────────────────────
-    _save(all_games, errors, total_teams, output_file)
+    # MUST pass processed_teams — otherwise the meta is overwritten with an empty
+    # list and the next run would re-scrape every team from scratch.
+    _save(all_games, errors, total_teams, output_file, processed_teams)
+
+    # Surface any team in the input that we never reached.
+    all_input_paths = {team_url_to_path(t["teamUrl"]) for t in teams}
+    missing = all_input_paths - processed_teams
+    if missing:
+        print(f"\n[WARNING] {len(missing)} input teams were not processed by the scraper:")
+        for p in list(missing)[:20]:
+            print(f"    {p}")
+        if len(missing) > 20:
+            print(f"    ... and {len(missing) - 20} more")
+        print("Re-run the scraper to retry these teams.")
 
     unique_guids = len({g["contest_id"] for g in all_games})
     print("\n" + "=" * 60)

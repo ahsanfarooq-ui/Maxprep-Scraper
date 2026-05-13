@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import glob
 from collections import defaultdict
 
@@ -26,9 +27,19 @@ def _build_master_name_lookup():
                         if tid and name:
                             name = name.replace('Aandm', 'A&M').replace('aandm', 'a&m')
                             lookup[tid] = name
+                        elif tid:
+                            # Derive name from URL slug if master list lacks it.
+                            m = re.match(r'[^/]+/[^/]+/([^/]+)/', tid)
+                            if m:
+                                lookup[tid] = m.group(1).replace('-', ' ').title()
         except Exception:
             pass
     return lookup
+
+
+def _slugify(name):
+    """Match the slug scheme used by scrape_box_scores.py for opponent team_ids."""
+    return re.sub(r'[^a-z0-9]+', '-', (name or '').lower()).strip('-')
 
 def safe_float(value):
     try:
@@ -71,16 +82,49 @@ def process_stats(input_file=None, output_file=None):
     else:
         print("  Master name lookup not found — team names will use box score values.")
 
-    # A "scraped" team has a full canonical path ID (e.g. tx/city/team/basketball/sport).
-    # An unscraped team only appears as an opponent and gets a short normalised ID (e.g. "westwood").
-    # We use slash-count to distinguish them.
-    def _is_scraped(team_id):
+    # A "scraped" team has a full canonical path ID (e.g. tx/city/team/basketball).
+    # The scraper always generates SHORT slug IDs for opponents (regardless of whether
+    # that opponent is also a scraped team), so we can't tell from the team_id alone
+    # whether an opponent corresponds to a scraped team. We build a slug->full_id map
+    # to detect this and avoid double-counting / ghost team records.
+    def _is_full_path(team_id):
         return team_id.count('/') >= 3
 
+    # Map opponent-slug -> scraped full team_id, using both the master list and
+    # team-side appearances in the box scores.
+    print("  Building slug -> scraped team_id map...")
+    slug_to_full = {}
+    for tid, name in master_names.items():
+        slug = _slugify(name)
+        if slug:
+            slug_to_full[slug] = tid
+        # Also map the last URL segment (e.g. 'avinger-indians') in case the
+        # name -> slug conversion drifts from the URL.
+        last = tid.split('/')[-2] if tid.count('/') >= 3 else None
+        if last:
+            slug_to_full.setdefault(last, tid)
+    for game in data:
+        if game.get('is_deleted'):
+            continue
+        t_id = game.get('team', {}).get('team_id', '')
+        t_name = game.get('team', {}).get('team_name', '')
+        if _is_full_path(t_id):
+            for s in {_slugify(t_name), t_id.split('/')[-2] if t_id.count('/') >= 3 else ''}:
+                if s:
+                    slug_to_full.setdefault(s, t_id)
+
+    def _resolve_team_id(team_id):
+        """If team_id is a short slug that matches a known scraped team, return the
+        full canonical id; otherwise return team_id unchanged."""
+        if _is_full_path(team_id) or not team_id:
+            return team_id
+        return slug_to_full.get(team_id, team_id)
+
     # Pass 1: determine each player's primary team.
-    # - Count team-side appearances for all teams (scraped and unscraped).
-    # - Also count opponent-side appearances but ONLY for unscraped teams, so players
-    #   whose real team was never scraped still get correctly assigned.
+    # - Count team-side appearances for all teams.
+    # - Count opponent-side appearances ONLY when the opponent is NOT a scraped team
+    #   (i.e. its slug doesn't resolve to a full canonical id). This prevents players
+    #   on scraped teams from having their stats wrongly assigned to a slug ghost id.
     print("  Pass 1: building player->primary-team map...")
     player_team_game_count = defaultdict(lambda: defaultdict(int))
     for game in data:
@@ -96,19 +140,29 @@ def process_stats(input_file=None, output_file=None):
                     game_players.add(p_name)
             for p_name in game_players:
                 player_team_game_count[p_name][t_id] += 1
-        # Opponent side — only for unscraped teams
-        o_id = game.get('opponent', {}).get('team_id', '')
-        if o_id and not _is_scraped(o_id):
-            opp_players = set()
-            for section in ('shooting', 'detailed_shooting', 'totals', 'misc'):
-                for p in game.get(section, {}).get('opponent', {}).get('players', []):
-                    p_name = f"{p['player_name']}({p.get('class', '')})"
-                    opp_players.add(p_name)
-            for p_name in opp_players:
-                player_team_game_count[p_name][o_id] += 1
+        # Opponent side — skip if this slug resolves to a known scraped team.
+        o_id_raw = game.get('opponent', {}).get('team_id', '')
+        if o_id_raw and not _is_full_path(o_id_raw):
+            resolved = _resolve_team_id(o_id_raw)
+            if resolved == o_id_raw:  # truly unscraped opponent
+                opp_players = set()
+                for section in ('shooting', 'detailed_shooting', 'totals', 'misc'):
+                    for p in game.get(section, {}).get('opponent', {}).get('players', []):
+                        p_name = f"{p['player_name']}({p.get('class', '')})"
+                        opp_players.add(p_name)
+                for p_name in opp_players:
+                    player_team_game_count[p_name][o_id_raw] += 1
+
+    # Tiebreak: prefer full-canonical IDs over slug IDs so a player whose stats
+    # are split between their scraped team and a slug ghost lands on the real team.
+    def _pick_primary(counts):
+        max_count = max(counts.values())
+        candidates = [tid for tid, c in counts.items() if c == max_count]
+        full = [c for c in candidates if _is_full_path(c)]
+        return full[0] if full else candidates[0]
 
     player_primary_team = {
-        p_name: max(counts, key=counts.get)
+        p_name: _pick_primary(counts)
         for p_name, counts in player_team_game_count.items()
     }
     print(f"  Pass 1 complete. {len(player_primary_team)} unique players mapped.")
@@ -254,18 +308,32 @@ def process_stats(input_file=None, output_file=None):
                     season_t['TD'] += 1
 
         process_side('team', game.get('team'))
-        # Process opponent side only for unscraped teams (short IDs like "westwood").
-        # Scraped teams get their stats exclusively from their own game records.
+        # Process opponent side only for truly-unscraped opponents. If the slug
+        # resolves to a scraped team, that team's real stats live under its full
+        # canonical id — accumulating here would create a ghost slug record.
         opp_info = game.get('opponent', {})
-        if opp_info and not _is_scraped(opp_info.get('team_id', '')):
+        opp_id_raw = opp_info.get('team_id', '') if opp_info else ''
+        if (opp_info and opp_id_raw and not _is_full_path(opp_id_raw)
+                and _resolve_team_id(opp_id_raw) == opp_id_raw):
             process_side('opponent', opp_info)
 
     # Final calculation and formatting
     final_output_list = []
+    skipped_empty = 0
     for t_id, t_data in all_teams_data.items():
         team_name = t_data['team_name']
         players_accumulated = t_data['players']
         season_totals_accumulated = t_data['season_totals']
+
+        # Drop empty ghost records: slug-id teams (unscraped opponents) whose box
+        # score appearances never included any player stats. They contribute zero
+        # data and just clutter the output. Keep full-canonical teams even at
+        # zero so the scraped-team list stays complete.
+        if (not _is_full_path(t_id)
+                and season_totals_accumulated['GP'] == 0
+                and not players_accumulated):
+            skipped_empty += 1
+            continue
         
         def format_record(name, acc, record_type):
             gp = acc['GP']
@@ -347,10 +415,12 @@ def process_stats(input_file=None, output_file=None):
         for p_name, p_acc in players_accumulated.items():
             final_output_list.append(format_record(p_name, p_acc, "player"))
 
-    with open(output_file, 'w', encoding='utf-8') as f:
+    tmp = output_file + ".tmp"
+    with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(final_output_list, f, indent=4, ensure_ascii=False)
+    os.replace(tmp, output_file)
     
-    print(f"Accumulation complete. Created {len(final_output_list)} records.")
+    print(f"Accumulation complete. Created {len(final_output_list)} records. Skipped {skipped_empty} empty slug-ghost teams.")
     print(f"Data saved to {output_file}")
     
     # Print sample for the first few records

@@ -118,6 +118,18 @@ def clean_team_name(name):
     """Fix known URL-encoding corruptions in team names from the master list."""
     return name.replace("Aandm", "A&M").replace("aandm", "a&m")
 
+def name_from_url(team_url, fallback=""):
+    """Derive full team name (e.g. 'Avinger Indians') from the URL slug.
+    Falls back to the stored name only if the URL doesn't parse — this prevents
+    old/stale stored names like 'Avinger' from breaking the page parser, which
+    needs the full name to match the box score's team header."""
+    m = re.match(r"https?://(?:www\.)?maxpreps\.com/([^/]+)/([^/]+)/([^/]+)/", team_url)
+    if m:
+        slug = m.group(3).replace("-", " ").title()
+        if slug:
+            return clean_team_name(slug)
+    return clean_team_name(fallback)
+
 def decode_contest_guid(c_param):
     try:
         s = c_param.replace("-", "+").replace("_", "/")
@@ -137,10 +149,16 @@ def _raw_fetch_schedule(bid, team_path):
     try:
         r = _session().get(url, timeout=20)
         if r.status_code == 404: return {"_expired": True}
+        if r.status_code == 429:
+            time.sleep(int(r.headers.get("Retry-After", 5)))
+            return "_retry"
+        if r.status_code in (500, 502, 503, 504): return "_retry"
         if r.status_code != 200: return None
         data = r.json()
         return (data.get("pageProps", {}).get("initialPageProps", {}).get("contests")
                 or data.get("pageProps", {}).get("contests") or [])
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return "_retry"
     except Exception: return None
 
 def get_game_entries(contests):
@@ -174,9 +192,18 @@ def _check_soup(soup, team_name):
 def fetch_sched_worker(team):
     path = team_url_to_path(team["teamUrl"])
     bid, version = get_build_id()
-    for _ in range(2):
+    # Up to 5 attempts: handle 404 (stale build id), 5xx, 429, and connection errors
+    for attempt in range(5):
         contests = _raw_fetch_schedule(bid, path)
-        if contests is None: return team, None
+        if contests is None:
+            # Hard failure (non-retryable, non-200). Brief backoff before final retry.
+            if attempt < 4:
+                time.sleep(1 + attempt)
+                continue
+            return team, None
+        if contests == "_retry":
+            time.sleep(min(2 ** attempt, 10))
+            continue
         if isinstance(contests, dict) and contests.get("_expired"):
             bid, version = refresh_build_id(version)
             continue
@@ -219,8 +246,11 @@ def _save_gaps(output_file, state_name, state_code, total_count, full_data, part
         "teamsNoBoxScores": sorted(no_data, key=lambda x: x["teamName"]),
         "errors": errors,
     }
-    with open(output_file, "w", encoding="utf-8") as f:
+    # Atomic write: avoid leaving a half-written file if interrupted mid-save.
+    tmp = output_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(output, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, output_file)
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -269,8 +299,22 @@ def main():
         print(f"Error: State {state_code} not found."); sys.exit(1)
 
     state_regions = data["byState"][state_code]["regions"]
-    all_teams = [{"teamName": clean_team_name(t["teamName"]), "teamUrl": t["teamUrl"], "region": r}
-                 for r, d in state_regions.items() for t in d["teams"]]
+    # Dedup by teamUrl in case the master list has duplicate URL entries across regions.
+    # Use URL-derived name (e.g. 'Avinger Indians') so the page parser can match
+    # the team header even when the stored name is stale (e.g. just 'Avinger').
+    seen_urls = set()
+    all_teams = []
+    for r, d in state_regions.items():
+        for t in d["teams"]:
+            url = t.get("teamUrl", "")
+            if not url or url in seen_urls:
+                continue
+            seen_urls.add(url)
+            all_teams.append({
+                "teamName": name_from_url(url, t.get("teamName", "")),
+                "teamUrl": url,
+                "region": r,
+            })
     total = len(all_teams)
 
     # Resume Logic
@@ -287,6 +331,15 @@ def main():
                 print(f"Resuming: {len(processed_teams)} teams already processed.")
         except Exception: pass
 
+    # Retry-on-resume: drop previously-errored teams from processed_teams so they
+    # get re-attempted. (A network blip shouldn't permanently exclude a team.)
+    if errors:
+        retry_paths = {team_url_to_path(e["teamUrl"]) for e in errors if e.get("teamUrl")}
+        processed_teams -= retry_paths
+        errors = []
+        if retry_paths:
+            print(f"Re-queueing {len(retry_paths)} previously-errored teams for retry.")
+
     # Filter teams for Phase 1
     teams_to_process = [t for t in all_teams if team_url_to_path(t["teamUrl"]) not in processed_teams]
     if teams_to_process:
@@ -296,12 +349,27 @@ def main():
         with ThreadPoolExecutor(max_workers=SCHED_WORKERS) as pool:
             futures = {pool.submit(fetch_sched_worker, t): t for t in teams_to_process}
             for i, fut in enumerate(as_completed(futures), 1):
-                team, entries = fut.result()
+                # Per-future try/except: a single failure must not abort the loop
+                # and silently drop every remaining team's schedule result.
+                try:
+                    team, entries = fut.result()
+                except Exception as e:
+                    orig_team = futures[fut]
+                    print(f"  [WARN] Schedule worker crashed for {orig_team['teamName']}: {e}")
+                    sched_results[orig_team["teamUrl"]] = (orig_team, None)
+                    continue
                 # Key by teamUrl (unique) not teamName — duplicate names would silently
                 # overwrite each other causing teams to be skipped entirely.
                 sched_results[team["teamUrl"]] = (team, entries)
                 if i % 100 == 0 or i == len(teams_to_process):
                     print(f"  Schedules: {i}/{len(teams_to_process)} done")
+
+        # Safety net: every team submitted must produce a sched_results entry,
+        # otherwise it would never reach Phase 2 and be silently lost.
+        for t in teams_to_process:
+            if t["teamUrl"] not in sched_results:
+                print(f"  [WARN] No sched_result for {t['teamName']} — recording as error.")
+                sched_results[t["teamUrl"]] = (t, None)
 
         # Phase 2: Game checks
         print(f"Phase 2: Checking games in parallel ({GAME_WORKERS} workers)...")
@@ -309,51 +377,76 @@ def main():
         game_jobs = []
         for turl, (team, entries) in sched_results.items():
             if entries is None:
+                # Record error but DO NOT add to processed_teams — next run should retry.
                 errors.append({"teamName": team["teamName"], "teamUrl": team["teamUrl"], "region": team["region"]})
-                processed_teams.add(team_url_to_path(team["teamUrl"]))
             elif not entries:
                 city_m = re.search(rf"/{state_lower}/([^/]+)/", team["teamUrl"])
                 city = city_m.group(1).replace("-", " ").title() if city_m else state_name
-                no_data.append({"teamName": team["teamName"], "teamUrl": team["teamUrl"], "region": team["region"], 
+                no_data.append({"teamName": team["teamName"], "teamUrl": team["teamUrl"], "region": team["region"],
                                 "gamesChecked": 0, "gamesWithStats": 0, "gamesMissing": 0,
-                                "alternativeSources": {"scoreStream": scorestream_url(team["teamName"], state_name), 
+                                "alternativeSources": {"scoreStream": scorestream_url(team["teamName"], state_name),
                                                      "googleSearch": google_search_url(team["teamName"], city, state_name)}})
                 processed_teams.add(team_url_to_path(team["teamUrl"]))
             else:
                 game_jobs.append({'team': team, 'entries': entries})
 
         def process_team_games(job):
-            team, entries = job['team'], job['entries']
-            games_checked, games_with_stats = 0, 0
-            for url, guid, ssid in entries:
-                res = check_game_worker(url, guid, ssid, team["teamName"])
-                if res is not None:
-                    games_checked += 1
-                    if res: games_with_stats += 1
-            
-            entry = {"teamName": team["teamName"], "teamUrl": team["teamUrl"], "region": team["region"],
-                     "gamesChecked": games_checked, "gamesWithStats": games_with_stats, "gamesMissing": games_checked - games_with_stats}
-            
-            with agg_lock:
-                if games_checked == 0: no_data.append(entry)
-                elif games_with_stats == games_checked: full_data.append(entry)
-                elif games_with_stats > 0: partial_data.append(entry)
-                else: no_data.append(entry)
-                processed_teams.add(team_url_to_path(team["teamUrl"]))
-                
-                # Print frequent progress
-                tdone = len(processed_teams)
-                pct = tdone / total * 100
-                print(f"  [{tdone:>4}/{total}] {pct:5.1f}% | Full: {len(full_data):>4} | Part: {len(partial_data):>4} | {team['teamName']}")
-                
-                if tdone % 10 == 0 or tdone == total:
-                    _save_gaps(output_file, state_name, state_code, total, full_data, partial_data, no_data, errors, processed_teams, args.sport, args.season)
+            # Outer try/except: a single team failure must not kill the pool and
+            # silently drop every subsequent team's result.
+            try:
+                team, entries = job['team'], job['entries']
+                games_checked, games_with_stats = 0, 0
+                for url, guid, ssid in entries:
+                    res = check_game_worker(url, guid, ssid, team["teamName"])
+                    if res is not None:
+                        games_checked += 1
+                        if res: games_with_stats += 1
+
+                entry = {"teamName": team["teamName"], "teamUrl": team["teamUrl"], "region": team["region"],
+                         "gamesChecked": games_checked, "gamesWithStats": games_with_stats, "gamesMissing": games_checked - games_with_stats}
+
+                with agg_lock:
+                    if games_checked == 0: no_data.append(entry)
+                    elif games_with_stats == games_checked: full_data.append(entry)
+                    elif games_with_stats > 0: partial_data.append(entry)
+                    else: no_data.append(entry)
+                    processed_teams.add(team_url_to_path(team["teamUrl"]))
+
+                    # Print frequent progress
+                    tdone = len(processed_teams)
+                    pct = tdone / total * 100
+                    print(f"  [{tdone:>4}/{total}] {pct:5.1f}% | Full: {len(full_data):>4} | Part: {len(partial_data):>4} | {team['teamName']}")
+
+                    if tdone % 10 == 0 or tdone == total:
+                        try:
+                            _save_gaps(output_file, state_name, state_code, total, full_data, partial_data, no_data, errors, processed_teams, args.sport, args.season)
+                        except Exception as save_e:
+                            print(f"  [WARN] Periodic save failed: {save_e}")
+            except Exception as e:
+                team = job.get('team', {})
+                print(f"  [ERROR] process_team_games crashed for {team.get('teamName', '?')}: {e}")
+                with agg_lock:
+                    errors.append({"teamName": team.get("teamName", ""), "teamUrl": team.get("teamUrl", ""),
+                                   "region": team.get("region", ""), "stage": "phase2", "error": str(e)})
 
         with ThreadPoolExecutor(max_workers=GAME_WORKERS) as pool:
             list(pool.map(process_team_games, game_jobs))
 
         _save_gaps(output_file, state_name, state_code, total, full_data, partial_data, no_data, errors, processed_teams, args.sport, args.season)
-        print(f"\nGap analysis complete for {total} teams.")
+
+        # Final reconciliation: any team in the master list that is not in
+        # processed_teams AND not in errors is a silently-dropped team. Surface them.
+        all_paths = {team_url_to_path(t["teamUrl"]) for t in all_teams}
+        error_paths = {team_url_to_path(e["teamUrl"]) for e in errors if e.get("teamUrl")}
+        missing = all_paths - processed_teams - error_paths
+        if missing:
+            print(f"\n[WARNING] {len(missing)} teams were not processed and have no error record:")
+            for p in list(missing)[:20]:
+                print(f"    {p}")
+            if len(missing) > 20:
+                print(f"    ... and {len(missing) - 20} more")
+            print("Re-run the command to retry these teams.")
+        print(f"\nGap analysis complete for {total} teams. Processed: {len(processed_teams)}, Errors: {len(errors)}, Missing: {len(missing)}.")
     else:
         print(f"Gap analysis already complete for {total} teams. Proceeding to next steps...")
 
