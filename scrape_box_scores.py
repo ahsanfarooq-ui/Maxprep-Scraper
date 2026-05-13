@@ -339,8 +339,23 @@ def parse_game_page(soup, our_team_name):
         return n == our_norm or our_norm in n or n in our_norm
 
     team_key = next((n for n in team_data if _matches(n)), None)
+
     if not team_key:
-        team_key = next(iter(team_data))   # fallback: first team found
+        # Our team's stats are not on this page — all found data belongs to the
+        # opponent. Putting it in the team section would create ghost records
+        # (opponent players accumulated under the wrong team ID).
+        opp_key = next(iter(team_data)) if team_data else None
+        result = {
+            "team_name": our_team_name,
+            "opp_name":  opp_key or "",
+        }
+        for cat in ("shooting", "detailed_shooting", "totals", "misc"):
+            result[cat] = {
+                "team":     {"players": []},
+                "opponent": {"players": team_data.get(opp_key, {}).get(cat, [])
+                             if opp_key else []},
+            }
+        return result
 
     opp_key = next((n for n in team_data if n != team_key), None)
 
