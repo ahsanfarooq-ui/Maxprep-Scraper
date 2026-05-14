@@ -3,6 +3,7 @@ import os
 import sys
 import json
 import time
+import signal
 import subprocess
 import streamlit as st
 
@@ -137,6 +138,34 @@ def is_pid_running(pid):
         return True   # process exists but we can't signal it
     except Exception:
         return False
+
+
+def stop_pid(pid):
+    """Kill the scraper subprocess (and any children it spawned) cross-platform."""
+    if pid is None:
+        return False
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if sys.platform == "win32":
+        # /T = also kill child processes, /F = force
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                           check=False, capture_output=True)
+            return True
+        except Exception:
+            return False
+    # Unix: signal the whole process group (Popen used start_new_session=True)
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        return True
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+            return True
+        except Exception:
+            return False
 
 def tail_log(n=60):
     if not os.path.exists(LOG_FILE):
@@ -306,7 +335,16 @@ if disk is not None:
     st.divider()
 
     if running:
-        st.info(f"⏳ Scraping in progress: **{disk['label']}**")
+        info_col, btn_col = st.columns([4, 1])
+        with info_col:
+            st.info(f"⏳ Scraping in progress: **{disk['label']}**")
+        with btn_col:
+            # Restart: stops the running scrape and returns to the selection screen.
+            if st.button("🛑 Restart", type="secondary", use_container_width=True,
+                         help="Stop the current scrape and pick a new state/sport/season."):
+                stop_pid(disk.get("pid"))
+                clear_disk_state()
+                st.rerun()
     else:
         if os.path.exists(disk.get("acc_file", "")):
             st.success(f"🎉 Completed: **{disk['label']}** — Download your files below, then start a new scrape above.")

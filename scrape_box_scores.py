@@ -24,16 +24,30 @@ import time
 import base64
 import struct
 import argparse
+import threading
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-INPUT_FILE  = "texas_data_gaps.json"
-OUTPUT_FILE = "texas_box_scores.json"
-DELAY       = 0.6          # seconds between HTTP requests
+INPUT_FILE   = "texas_data_gaps.json"
+OUTPUT_FILE  = "texas_box_scores.json"
+DELAY        = 0.6          # seconds between HTTP requests (per worker thread)
+TEAM_WORKERS = 15           # parallel teams (each thread scrapes its team's games sequentially)
+
+# When refresh_build_id returns the SAME bid (i.e. MaxPreps hasn't rolled yet),
+# wait this long before checking again, up to BID_STABLE_MAX_RETRIES times.
+BID_STABLE_WAIT_SEC   = 15 * 60   # 15 minutes
+BID_STABLE_MAX_RETRIES = 10        # ~2.5 hours total before giving up on a team
+
+# Timestamped print: every log line gets a "[YYYY-MM-DD HH:MM:SS]" prefix so the
+# Streamlit log viewer and stdout show live timing.
+_original_print = print
+def print(*args, **kwargs):
+    _original_print(time.strftime('[%Y-%m-%d %H:%M:%S]'), *args, **kwargs)
 
 HEADERS = {
     "User-Agent": (
@@ -65,24 +79,60 @@ def _make_session():
     s.headers.update(HEADERS)
     return s
 
-SESSION = _make_session()
+# Thread-local sessions: a fresh Session per thread avoids any contention on
+# the connection pool and matches the pattern used by app.py.
+_tls = threading.local()
 
-# ── Schedule helpers (same logic as texas_data_gap_finder.py) ─────────────────
+def _get_session():
+    if not hasattr(_tls, "session"):
+        _tls.session = _make_session()
+    return _tls.session
 
-def get_build_id():
+# ── Thread-safe build ID management ──────────────────────────────────────────
+# Many threads can hit a stale build ID at the same time. Without locking they
+# would all independently refetch, blasting MaxPreps with concurrent root-page
+# requests. The lock + version pattern (mirrored from app.py) collapses those
+# concurrent refresh attempts into a single fetch.
+
+_bid_lock = threading.Lock()
+_bid_value = None
+_bid_version = 0
+
+def _fetch_build_id_raw():
+    """Fetch the build ID with retry. Caller must hold _bid_lock."""
     delays = [5, 10, 20, 40, 60]
+    last_err = None
     for attempt, wait in enumerate(delays, 1):
         try:
-            r = SESSION.get("https://www.maxpreps.com", timeout=30, headers=HTML_HEADERS)
+            r = _get_session().get("https://www.maxpreps.com", timeout=30, headers=HTML_HEADERS)
             r.raise_for_status()
             m = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", r.text)
             if m:
                 return m.group(1)
             print(f"  [WARN] Build ID not found in page (attempt {attempt}/{len(delays)}). Waiting {wait}s…")
         except Exception as e:
+            last_err = e
             print(f"  [WARN] Build ID fetch error: {e} (attempt {attempt}/{len(delays)}). Waiting {wait}s…")
         time.sleep(wait)
-    raise RuntimeError("MaxPreps build ID not found after all retries — MaxPreps may be rate-limiting. Try again later.")
+    raise RuntimeError(f"MaxPreps build ID not found after all retries: {last_err}")
+
+def get_build_id():
+    """Returns (build_id, version) atomically. Lazy-fetches on first call."""
+    global _bid_value, _bid_version
+    with _bid_lock:
+        if _bid_value is None:
+            _bid_value = _fetch_build_id_raw()
+        return _bid_value, _bid_version
+
+def refresh_build_id(old_version):
+    """Refresh only if the cached version matches old_version. Collapses
+    concurrent 404-driven refreshes from many threads into a single fetch."""
+    global _bid_value, _bid_version
+    with _bid_lock:
+        if _bid_version == old_version:
+            _bid_value = _fetch_build_id_raw()
+            _bid_version += 1
+        return _bid_value, _bid_version
 
 
 def team_url_to_path(team_url):
@@ -111,7 +161,7 @@ def fetch_schedule(build_id, team_path):
     url = f"https://www.maxpreps.com/_next/data/{build_id}/{team_path}/schedule.json"
     time.sleep(DELAY)
     try:
-        r = SESSION.get(url, timeout=25)
+        r = _get_session().get(url, timeout=25)
         if r.status_code == 404:
             return {"_expired": True}
         if r.status_code != 200:
@@ -122,6 +172,9 @@ def fetch_schedule(build_id, team_path):
             or data.get("pageProps", {}).get("contests")
             or []
         )
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        # Re-raise so the worker's outer retry can decide whether to back off.
+        raise
     except Exception as e:
         print(f"    [WARN] schedule fetch failed for {team_path}: {e}")
         return None
@@ -409,7 +462,7 @@ def scrape_game(game_url, guid, ssid, our_team_name, team_id):
     )
 
     try:
-        r = SESSION.get(url, headers=HTML_HEADERS, timeout=25, allow_redirects=True)
+        r = _get_session().get(url, headers=HTML_HEADERS, timeout=25, allow_redirects=True)
         if r.status_code == 404:
             return {"_404": True}
         if r.status_code != 200:
@@ -493,15 +546,123 @@ def _name_from_url(team_url, fallback=""):
 
 # ── Core scraping logic (callable from gap finder or standalone) ──────────────
 
-def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
+def _scrape_team(team):
+    """Worker: scrape one team's full set of games. Returns
+    (team_id, team_name, team_url, games_list, error_dict_or_None).
+
+    All HTTP work happens here — no shared state is touched. Caller commits
+    the returned games/error under a lock.
+    """
+    team_url = team["teamUrl"]
+    team_id = team_url_to_path(team_url)
+    # Derive team_name from URL slug rather than trusting the gaps file —
+    # stale stored names (e.g. 'Avinger' instead of 'Avinger Indians') break
+    # the box-score page parser's team-header match.
+    team_name = _name_from_url(team_url, team.get("teamName", ""))
+    path = team_url_to_path(team_url)
+
+    # ── Schedule with bounded retries ────────────────────────────────────────
+    contests = None
+    bid_change_retries = 0     # 404s where refresh produced a NEW bid
+    stable_bid_retries = 0     # 404s where refresh returned the SAME bid (wait 15 min, then retry)
+    none_retries = 0
+    net_retries = 0
+    bid, bid_version = get_build_id()
+    while contests is None:
+        try:
+            contests = fetch_schedule(bid, path)
+
+            if isinstance(contests, dict) and contests.get("_expired"):
+                # 404 on schedule.json. Try a fresh build_id.
+                new_bid, new_bid_version = refresh_build_id(bid_version)
+                if new_bid != bid:
+                    # MaxPreps rolled the build id — retry with the new one immediately.
+                    bid_change_retries += 1
+                    if bid_change_retries > 3:
+                        return team_id, team_name, team_url, [], {
+                            "teamName": team_name, "teamUrl": team_url,
+                            "stage": "schedule", "reason": "build_id_kept_rolling",
+                        }
+                    bid, bid_version = new_bid, new_bid_version
+                    contests = None
+                    continue
+                # Same bid back. Per user-requested strategy: MaxPreps may not have
+                # rolled the build id yet — wait 15 minutes then check again. Repeat
+                # up to BID_STABLE_MAX_RETRIES times before skipping the team.
+                stable_bid_retries += 1
+                if stable_bid_retries > BID_STABLE_MAX_RETRIES:
+                    return team_id, team_name, team_url, [], {
+                        "teamName": team_name, "teamUrl": team_url,
+                        "stage": "schedule",
+                        "reason": f"build_id_stable_after_{BID_STABLE_MAX_RETRIES}x{BID_STABLE_WAIT_SEC//60}min_waits",
+                    }
+                print(f"  [{team_name}] schedule 404, bid={bid} unchanged. "
+                      f"Waiting {BID_STABLE_WAIT_SEC // 60} min for build id to update "
+                      f"({stable_bid_retries}/{BID_STABLE_MAX_RETRIES}).")
+                time.sleep(BID_STABLE_WAIT_SEC)
+                contests = None
+                continue
+
+            if contests is None:
+                none_retries += 1
+                if none_retries > 5:
+                    return team_id, team_name, team_url, [], {
+                        "teamName": team_name, "teamUrl": team_url,
+                        "stage": "schedule", "reason": "fetch_returned_none",
+                    }
+                time.sleep(5)
+                continue
+
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+            net_retries += 1
+            if net_retries > 5:
+                return team_id, team_name, team_url, [], {
+                    "teamName": team_name, "teamUrl": team_url,
+                    "stage": "schedule", "error": str(e),
+                }
+            time.sleep(min(5 * net_retries, 30))
+            continue
+        except Exception as e:
+            return team_id, team_name, team_url, [], {
+                "teamName": team_name, "teamUrl": team_url,
+                "stage": "schedule", "error": str(e),
+            }
+
+    # ── Games (sequential within a single team to cap per-team request rate) ──
+    entries = get_game_entries(contests)
+    team_games = []
+    for game_url, guid, ssid in entries:
+        if not guid:
+            continue
+        for _attempt in range(3):
+            try:
+                record = scrape_game(game_url, guid, ssid, team_name, team_id)
+                if isinstance(record, dict) and record.get("_404"):
+                    break
+                if record:
+                    team_games.append(record)
+                break
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                time.sleep(min(10 * (_attempt + 1), 30))
+            except Exception:
+                break
+
+    return team_id, team_name, team_url, team_games, None
+
+
+def run(input_file=None, output_file=None, sport="boys", season="2025-2026", workers=None):
     """
     Scrape all full/partial teams from a gaps JSON file.
     Can be called programmatically or invoked via main().
+
+    workers: parallel team count (default: TEAM_WORKERS = 15).
     """
     if input_file is None:
         input_file = INPUT_FILE
     if output_file is None:
         output_file = OUTPUT_FILE
+    if workers is None or workers <= 0:
+        workers = TEAM_WORKERS
 
     # ── Load input ───────────────────────────────────────────────────────────
     with open(input_file, encoding="utf-8") as f:
@@ -512,10 +673,12 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
         gaps.get("teamsPartialBoxScores", [])
     )
     total_teams = len(teams)
-    print(f"Teams to process : {total_teams}  (full + partial)\n")
+    print(f"Teams to process : {total_teams}  (full + partial)")
+    print(f"Workers          : {workers}\n")
 
-    build_id = get_build_id()
-    print(f"Build ID : {build_id}\n")
+    # Warm the build ID cache before fanning out so all threads share one fetch.
+    bid, _ = get_build_id()
+    print(f"Build ID : {bid}\n")
     print(f"Output   : {output_file}\n")
     print("─" * 60)
 
@@ -535,108 +698,59 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
         except Exception as e:
             print(f"Could not load existing output file for resumption: {e}")
 
-    for t_idx, team in enumerate(teams, 1):
-        team_url  = team["teamUrl"]
-        team_id   = team_url_to_path(team_url)
-        # Derive team_name from URL slug rather than trusting the gaps file —
-        # stale stored names (e.g. 'Avinger' instead of 'Avinger Indians') break
-        # the box-score page parser's team-header match.
-        team_name = _name_from_url(team_url, team.get("teamName", ""))
+    # Retry-on-resume: drop previously errored teams so they get re-attempted.
+    if errors:
+        retry_paths = {team_url_to_path(e["teamUrl"]) for e in errors if e.get("teamUrl")}
+        processed_teams -= retry_paths
+        errors = []
+        if retry_paths:
+            print(f"Re-queueing {len(retry_paths)} previously-errored teams for retry.")
 
-        if team_id in processed_teams:
-            # Skip already processed teams
-            continue
+    teams_to_do = [t for t in teams if team_url_to_path(t["teamUrl"]) not in processed_teams]
+    if not teams_to_do:
+        print(f"Nothing to do — all {total_teams} teams already processed.")
+    else:
+        print(f"Submitting {len(teams_to_do)} teams to {workers} workers...\n")
+        agg_lock = threading.Lock()
 
-        print(f"\nProcessing team {t_idx}/{total_teams}: {team_name}")
+        def _commit_result(team_id, team_name, team_url, games, error):
+            with agg_lock:
+                if error is not None:
+                    errors.append(error)
+                    # Don't mark errored teams as processed — future run will retry.
+                else:
+                    all_games.extend(games)
+                    processed_teams.add(team_id)
+                tdone = len(processed_teams)
+                errs = len(errors)
+                pct = tdone / total_teams * 100 if total_teams else 0.0
+                status = "ERR " if error is not None else f"+{len(games):>3}"
+                print(f"  [{tdone:>4}/{total_teams}] {pct:5.1f}% | err={errs:<3} | games={len(all_games):>5} | {status} | {team_name}")
+                # Periodic save (every 10 successful team completions).
+                if (tdone % 10 == 0 or tdone == total_teams) and error is None:
+                    try:
+                        _save(all_games, errors, total_teams, output_file, processed_teams)
+                    except Exception as save_e:
+                        print(f"  [WARN] Periodic save failed: {save_e}")
 
-        # ── Schedule (with bounded retry logic — must not loop forever) ──────
-        contests = None
-        bid_retries = 0
-        none_retries = 0
-        net_retries = 0
-        gave_up = False
-        while contests is None:
-            try:
-                path = team_url_to_path(team_url)
-                contests = fetch_schedule(build_id, path)
-
-                if isinstance(contests, dict) and contests.get("_expired"):
-                    bid_retries += 1
-                    if bid_retries > 3:
-                        print(f"  [WARN] Build ID refresh failed {bid_retries} times for {team_name}. Skipping.")
-                        contests = []
-                        break
-                    print(f"  [INFO] Build ID expired or 404. Refreshing build ID...")
-                    build_id = get_build_id()
-                    print(f"  [INFO] New Build ID: {build_id}")
-                    time.sleep(2)
-                    contests = None
-                    continue
-
-                if contests is None:
-                    none_retries += 1
-                    if none_retries > 5:
-                        print(f"  [WARN] Schedule fetch keeps returning None for {team_name}. Recording error and skipping.")
-                        errors.append({"teamName": team_name, "teamUrl": team_url, "stage": "schedule"})
-                        gave_up = True
-                        break
-                    print(f"  [WARN] Schedule fetch returned None for {team_name}. Retry {none_retries}/5 in 5s...")
-                    time.sleep(5)
-                    continue
-
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                net_retries += 1
-                if net_retries > 5:
-                    print(f"  [ERROR] Network issue persists for {team_name}: {e}. Recording error and skipping.")
-                    errors.append({"teamName": team_name, "teamUrl": team_url, "stage": "schedule", "error": str(e)})
-                    gave_up = True
-                    break
-                print(f"  [ERROR] Network issue: {e}. Retry {net_retries}/5 in 30s...")
-                time.sleep(30)
-                continue
-            except Exception as e:
-                print(f"  [ERROR] Unexpected error fetching schedule for {team_name}: {e}. Recording error and skipping.")
-                errors.append({"teamName": team_name, "teamUrl": team_url, "stage": "schedule", "error": str(e)})
-                gave_up = True
-                break
-
-        if gave_up:
-            # Don't mark the team as processed — so a future run can retry it.
-            _save(all_games, errors, total_teams, output_file, processed_teams)
-            continue
-
-        entries = get_game_entries(contests)
-        team_games_count = 0
-
-        for game_url, guid, ssid in entries:
-            if not guid:
-                continue
-            
-            for _attempt in range(3):
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_scrape_team, t): t for t in teams_to_do}
+            for fut in as_completed(futures):
                 try:
-                    record = scrape_game(game_url, guid, ssid, team_name, team_id)
-                    if isinstance(record, dict) and record.get("_404"):
-                        # boxscore.aspx 404 means the game has no page — skip it
-                        break
-                    if record:
-                        all_games.append(record)
-                        team_games_count += 1
-                    break
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-                    print(f"    [ERROR] Network issue scraping game: {e}. Retrying in 30s...")
-                    time.sleep(30)
+                    team_id, team_name, team_url, games, error = fut.result()
                 except Exception as e:
-                    print(f"    [ERROR] Error scraping game: {e}.")
-                    break
-
-        processed_teams.add(team_id)
-        print(f"    [DONE] Added {team_games_count} games for {team_name}")
-
-        # ── Progress + periodic save ──────────────────────────────────────────
-        _progress(t_idx, total_teams, all_games, errors)
-        
-        # Save after every team for "runtime" saving
-        _save(all_games, errors, total_teams, output_file, processed_teams)
+                    # A worker crash shouldn't kill the loop. Record it and move on.
+                    t = futures[fut]
+                    print(f"  [ERROR] Worker crashed for {t.get('teamName', '?')}: {e}")
+                    with agg_lock:
+                        errors.append({
+                            "teamName": t.get("teamName", ""),
+                            "teamUrl":  t.get("teamUrl", ""),
+                            "stage":    "worker_crash",
+                            "error":    str(e),
+                        })
+                    continue
+                _commit_result(team_id, team_name, team_url, games, error)
 
     # ── Final save ────────────────────────────────────────────────────────────
     # MUST pass processed_teams — otherwise the meta is overwritten with an empty
@@ -684,16 +798,6 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026"):
         print(f"  [ERROR] Accumulation failed: {e}")
 
 
-def _progress(t_idx, total, games, errors):
-    pct = t_idx / total * 100
-    bar_len = 20
-    filled_len = int(bar_len * t_idx // total)
-    bar = "█" * filled_len + "-" * (bar_len - filled_len)
-    
-    print(f"  Progress: |{bar}| {pct:5.1f}%  |  "
-          f"Total Games: {len(games):>5}  |  Errors: {len(errors)}")
-
-
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main():
@@ -714,11 +818,17 @@ def main():
     parser.add_argument(
         "--output", default=None, help="Explicit output file (optional)"
     )
+    parser.add_argument(
+        "--workers", type=int, default=TEAM_WORKERS,
+        help=f"Parallel team workers (default: {TEAM_WORKERS}). "
+             f"Each worker scrapes one team's games sequentially. "
+             f"Raise for speed, lower if you hit rate limits.",
+    )
     args = parser.parse_args()
 
     state_lower = args.state.lower()
     season_fn = args.season.replace("-", "_")
-    
+
     # Input: tx_data_gaps_boys_2025_2026.json
     input_file = f"{state_lower}_data_gaps_{args.sport}_{season_fn}.json"
     if not os.path.exists(input_file):
@@ -739,7 +849,8 @@ def main():
         # Output: tx_box_scores_boys_2025_2026.json
         out = input_file.replace("data_gaps", "box_scores")
 
-    run(input_file=input_file, output_file=out, sport=args.sport, season=args.season)
+    run(input_file=input_file, output_file=out, sport=args.sport,
+        season=args.season, workers=args.workers)
 
 
 if __name__ == "__main__":

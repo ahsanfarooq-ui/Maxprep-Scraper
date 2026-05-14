@@ -10,7 +10,7 @@ Expected runtime for 1800+ teams: ~30–45 minutes (vs 7 hours).
 
 HOW TO USE:::::===========================================================
 python app.py --state TX --sport girls --season 2025-2026
-python app.py --state NM --sport boys --season 2025-2026
+python app.py --state TX --sport boys --season 2025-2026
 ==========================================================================
 """
 
@@ -29,6 +29,11 @@ from urllib.parse import quote_plus
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DATA_DIR = os.environ.get("DATA_DIR", ".")
+
+# Timestamped print: every log line gets a "[YYYY-MM-DD HH:MM:SS]" prefix.
+_original_print = print
+def print(*args, **kwargs):
+    _original_print(time.strftime('[%Y-%m-%d %H:%M:%S]'), *args, **kwargs)
 
 # ─── State lookup ─────────────────────────────────────────────────────────────
 

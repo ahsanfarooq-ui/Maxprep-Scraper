@@ -1,8 +1,14 @@
 import json
 import os
 import re
+import time
 import glob
 from collections import defaultdict
+
+# Timestamped print: every log line gets a "[YYYY-MM-DD HH:MM:SS]" prefix.
+_original_print = print
+def print(*args, **kwargs):
+    _original_print(time.strftime('[%Y-%m-%d %H:%M:%S]'), *args, **kwargs)
 
 
 def _build_master_name_lookup():

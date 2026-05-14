@@ -3,6 +3,11 @@ MaxPreps Basketball – All States Team Counter
 
 
 python state_teams_counter.py --sport girls
+Just run these two commands from the project root:
+
+python state_teams_counter.py --sport boys  --season 2024-2025
+  
+python state_teams_counter.py --sport girls --season 2024-2025
 
 =============================================
 Walks MaxPreps' full hierarchy for every US state.
