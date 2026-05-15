@@ -156,9 +156,32 @@ def decode_contest_guid(c_param):
         return None
 
 
-def fetch_schedule(build_id, team_path):
-    """Returns contest list, {"_expired": True}, or None on error."""
-    url = f"https://www.maxpreps.com/_next/data/{build_id}/{team_path}/schedule.json"
+def _short_season(season):
+    """Normalise a season string for use as a URL path segment.
+
+    '2024-2025' → '24-25'; '24-25' → '24-25'; None/empty → None.
+    Used to fetch past-season schedule data — MaxPreps serves it at
+    {team_path}/{YY-YY}/schedule.json, NOT {team_path}/schedule.json
+    (which always returns the current season regardless of any flag we pass)."""
+    if not season:
+        return None
+    m = re.match(r'^(?:20)?(\d{2})-(?:20)?(\d{2})$', season.strip())
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    return season
+
+
+def fetch_schedule(build_id, team_path, season_suffix=None):
+    """Returns contest list, {"_expired": True}, or None on error.
+
+    season_suffix (e.g. '24-25') is inserted between the team path and
+    'schedule.json' so the past-season schedule is fetched instead of the
+    current one. None means current season (existing behavior).
+    """
+    if season_suffix:
+        url = f"https://www.maxpreps.com/_next/data/{build_id}/{team_path}/{season_suffix}/schedule.json"
+    else:
+        url = f"https://www.maxpreps.com/_next/data/{build_id}/{team_path}/schedule.json"
     time.sleep(DELAY)
     try:
         r = _get_session().get(url, timeout=25)
@@ -546,9 +569,12 @@ def _name_from_url(team_url, fallback=""):
 
 # ── Core scraping logic (callable from gap finder or standalone) ──────────────
 
-def _scrape_team(team):
+def _scrape_team(team, season_suffix=None):
     """Worker: scrape one team's full set of games. Returns
     (team_id, team_name, team_url, games_list, error_dict_or_None).
+
+    season_suffix (e.g. '24-25') makes the schedule fetch target a past
+    season. None = current season.
 
     All HTTP work happens here — no shared state is touched. Caller commits
     the returned games/error under a lock.
@@ -570,7 +596,7 @@ def _scrape_team(team):
     bid, bid_version = get_build_id()
     while contests is None:
         try:
-            contests = fetch_schedule(bid, path)
+            contests = fetch_schedule(bid, path, season_suffix=season_suffix)
 
             if isinstance(contests, dict) and contests.get("_expired"):
                 # 404 on schedule.json. Try a fresh build_id.
@@ -684,7 +710,12 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026", wor
             teams_by_url[url] = t
     teams = list(teams_by_url.values())
     total_teams = len(teams)
+    # Normalise the season into the YY-YY URL segment ('2024-2025' → '24-25').
+    # Without this the schedule fetch URL omits the season and MaxPreps falls
+    # back to the current season — silently scraping wrong-season games.
+    season_suffix = _short_season(season)
     print(f"Teams to process : {total_teams}  (full={len(full_b)} + partial={len(partial_b)} + no-data={len(none_b)})")
+    print(f"Season           : {season} (URL suffix: {season_suffix or '(current)'})")
     print(f"Workers          : {workers}\n")
 
     # Warm the build ID cache before fanning out so all threads share one fetch.
@@ -745,7 +776,7 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026", wor
                         print(f"  [WARN] Periodic save failed: {save_e}")
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_scrape_team, t): t for t in teams_to_do}
+            futures = {pool.submit(_scrape_team, t, season_suffix): t for t in teams_to_do}
             for fut in as_completed(futures):
                 try:
                     team_id, team_name, team_url, games, error = fut.result()

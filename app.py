@@ -9,8 +9,8 @@ Expected runtime for 1800+ teams: ~30–45 minutes (vs 7 hours).
 
 
 HOW TO USE:::::===========================================================
-python app.py --state TX --sport girls --season 2025-2026
-python app.py --state TX --sport boys --season 2025-2026
+python app.py --state AL --sport girls --season 2024-2025   
+python app.py --state AL --sport boys --season 2024-2025
 ==========================================================================
 """
 
@@ -148,8 +148,20 @@ def decode_contest_guid(c_param):
         return f"{p1:08x}-{p2:04x}-{p3:04x}-{p4[:4]}-{p4[4:]}"
     except Exception: return None
 
-def _raw_fetch_schedule(bid, team_path):
-    url = f"https://www.maxpreps.com/_next/data/{bid}/{team_path}/schedule.json"
+def _short_season(season):
+    """Normalise '2024-2025' or '24-25' → '24-25'. Used to inject the season
+    segment into the schedule fetch URL so past seasons are actually fetched."""
+    if not season:
+        return None
+    m = re.match(r'^(?:20)?(\d{2})-(?:20)?(\d{2})$', season.strip())
+    return f"{m.group(1)}-{m.group(2)}" if m else season
+
+
+def _raw_fetch_schedule(bid, team_path, season_suffix=None):
+    if season_suffix:
+        url = f"https://www.maxpreps.com/_next/data/{bid}/{team_path}/{season_suffix}/schedule.json"
+    else:
+        url = f"https://www.maxpreps.com/_next/data/{bid}/{team_path}/schedule.json"
     time.sleep(DELAY)
     try:
         r = _session().get(url, timeout=20)
@@ -194,12 +206,12 @@ def _check_soup(soup, team_name):
 
 # ─── Workers ──────────────────────────────────────────────────────────────────
 
-def fetch_sched_worker(team):
+def fetch_sched_worker(team, season_suffix=None):
     path = team_url_to_path(team["teamUrl"])
     bid, version = get_build_id()
     # Up to 5 attempts: handle 404 (stale build id), 5xx, 429, and connection errors
     for attempt in range(5):
-        contests = _raw_fetch_schedule(bid, path)
+        contests = _raw_fetch_schedule(bid, path, season_suffix=season_suffix)
         if contests is None:
             # Hard failure (non-retryable, non-200). Brief backoff before final retry.
             if attempt < 4:
@@ -345,6 +357,13 @@ def main():
         if retry_paths:
             print(f"Re-queueing {len(retry_paths)} previously-errored teams for retry.")
 
+    # Normalise the season into '24-25'-style URL segment for the schedule fetch.
+    # Without this the gap finder asks MaxPreps for the schedule at the path-less
+    # URL, which silently falls back to the CURRENT season — so passing
+    # --season 2024-2025 would still scrape 2025-2026 games.
+    season_suffix = _short_season(args.season)
+    print(f"Season URL suffix: {season_suffix or '(current — no suffix)'}")
+
     # Filter teams for Phase 1
     teams_to_process = [t for t in all_teams if team_url_to_path(t["teamUrl"]) not in processed_teams]
     if teams_to_process:
@@ -352,7 +371,7 @@ def main():
         print(f"Phase 1: Fetching {len(teams_to_process)} schedules ({SCHED_WORKERS} workers)...")
         sched_results = {}
         with ThreadPoolExecutor(max_workers=SCHED_WORKERS) as pool:
-            futures = {pool.submit(fetch_sched_worker, t): t for t in teams_to_process}
+            futures = {pool.submit(fetch_sched_worker, t, season_suffix): t for t in teams_to_process}
             for i, fut in enumerate(as_completed(futures), 1):
                 # Per-future try/except: a single failure must not abort the loop
                 # and silently drop every remaining team's schedule result.

@@ -48,12 +48,16 @@ from scrape_box_scores import (
     get_build_id,
     refresh_build_id,
     _name_from_url,
+    _short_season,
     _save,
 )
 
 
-def _scrape_one_team(team):
+def _scrape_one_team(team, season_suffix=None):
     """Returns (team_id, team_name, team_url, games, error_or_None).
+
+    season_suffix (e.g. '24-25') makes the schedule fetch target a past
+    season. None = current season.
 
     Fixed bid handling: when refresh returns the SAME bid we know the 404 is
     a transient MaxPreps hiccup (not a stale build), so we back off and retry
@@ -73,7 +77,7 @@ def _scrape_one_team(team):
 
     while contests is None:
         try:
-            contests = fetch_schedule(bid, path)
+            contests = fetch_schedule(bid, path, season_suffix=season_suffix)
 
             if isinstance(contests, dict) and contests.get("_expired"):
                 new_bid, new_bid_version = refresh_build_id(bid_version)
@@ -219,7 +223,11 @@ def main():
 
     # Warm build ID cache before fanning out.
     bid, _ = get_build_id()
+    # Normalise season for the schedule fetch URL (otherwise MaxPreps falls
+    # back to the current season and we'd recover the wrong-season games).
+    season_suffix = _short_season(args.season)
     print(f"Build ID         : {bid}")
+    print(f"Season           : {args.season} (URL suffix: {season_suffix or '(current)'})")
     print(f"Workers          : {args.workers}\n")
     print("-" * 60)
 
@@ -249,7 +257,7 @@ def main():
                     print(f"  [WARN] Periodic save failed: {save_e}")
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(_scrape_one_team, t): t for t in affected}
+        futures = {pool.submit(_scrape_one_team, t, season_suffix): t for t in affected}
         for fut in as_completed(futures):
             try:
                 team_id, team_name, team_url, team_games, error = fut.result()
