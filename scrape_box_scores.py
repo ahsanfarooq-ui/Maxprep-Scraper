@@ -668,12 +668,23 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026", wor
     with open(input_file, encoding="utf-8") as f:
         gaps = json.load(f)
 
-    teams = (
-        gaps.get("teamsFullBoxScores", []) +
-        gaps.get("teamsPartialBoxScores", [])
-    )
+    # By default, scrape EVERY team — full, partial, AND teams the gap finder
+    # classified as "no box scores". The gap-finder classification is just a
+    # heuristic based on the presence of any stat-category divs on the page;
+    # it can misclassify teams whose schedules added stats after the gap run,
+    # so we re-check them too. Dedup by teamUrl in case the same team appears
+    # in more than one bucket of the gaps file.
+    full_b    = gaps.get("teamsFullBoxScores", [])
+    partial_b = gaps.get("teamsPartialBoxScores", [])
+    none_b    = gaps.get("teamsNoBoxScores", [])
+    teams_by_url = {}
+    for t in full_b + partial_b + none_b:
+        url = t.get("teamUrl")
+        if url and url not in teams_by_url:
+            teams_by_url[url] = t
+    teams = list(teams_by_url.values())
     total_teams = len(teams)
-    print(f"Teams to process : {total_teams}  (full + partial)")
+    print(f"Teams to process : {total_teams}  (full={len(full_b)} + partial={len(partial_b)} + no-data={len(none_b)})")
     print(f"Workers          : {workers}\n")
 
     # Warm the build ID cache before fanning out so all threads share one fetch.

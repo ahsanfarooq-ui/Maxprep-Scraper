@@ -175,7 +175,18 @@ def main():
     with open(gaps_fp, encoding="utf-8") as f: gaps = json.load(f)
     with open(bs_fp,   encoding="utf-8") as f: bs   = json.load(f)
 
-    input_teams = gaps.get("teamsFullBoxScores", []) + gaps.get("teamsPartialBoxScores", [])
+    # Consider every team the gap finder saw — full, partial, AND no-data —
+    # so the recovery picks up anything the main scraper missed regardless of
+    # its original gap-finder classification.
+    seen = set()
+    input_teams = []
+    for t in (gaps.get("teamsFullBoxScores", []) +
+              gaps.get("teamsPartialBoxScores", []) +
+              gaps.get("teamsNoBoxScores", [])):
+        url = t.get("teamUrl")
+        if url and url not in seen:
+            seen.add(url)
+            input_teams.append(t)
     games           = bs.get("games", [])
     meta            = bs.get("meta", {})
     processed_teams = set(meta.get("processedTeams", []))
