@@ -350,128 +350,323 @@ def _parse_players(table, category):
     return players
 
 
-def parse_game_page(soup, our_team_name):
+def _slugify(text):
+    """Normalised slug, matching the form MaxPreps uses in game URLs."""
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+# ── Opponent canonical-name index ──────────────────────────────────────────
+# Game URLs give us a SHORT opponent slug (e.g. 'san-augustine'). To put the
+# full canonical team_id ('tx/san-augustine/san-augustine-wolves/basketball/
+# girls') and full team_name ('San Augustine Wolves') into the opponent
+# section — same shape as our own team — we look the slug up in an index
+# built from the master team-list JSON.
+
+_opp_index_cache: dict = {}        # cache_key → {slug: [(team_id, team_name), …]}
+_opp_index_lock = threading.Lock()
+
+
+def _candidate_slugs_for_team(team_id, team_name):
+    """All slugs MaxPreps might use in a game URL to represent this team."""
+    out = set()
+    parts = (team_id or "").split("/")
+    if len(parts) >= 2 and parts[1]:
+        out.add(parts[1])                          # city slug
+    if len(parts) >= 3 and parts[2]:
+        out.add(parts[2])                          # full team slug
+        if "-" in parts[2]:
+            out.add(parts[2].rsplit("-", 1)[0])    # team slug minus mascot
+    name_slug = _slugify(team_name)
+    if name_slug:
+        out.add(name_slug)
+        if "-" in name_slug:
+            out.add(name_slug.rsplit("-", 1)[0])   # name minus last word
+    return {s for s in out if s}
+
+
+def _build_opp_index(sport, season):
+    """Load the master team list and build slug → [(team_id, team_name)].
+
+    Covers EVERY state in the master file, so out-of-state opponents (LA,
+    OK, NM, etc. teams visiting TX) also get canonical names — no short
+    slugs leaking into the output if we have the team's row anywhere.
+
+    Prefers the seasoned master file ('{sport}_basketball_all_states_{YY-YY}.json')
+    over the un-seasoned one ('{sport}_basketball_all_states.json').
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    short = _short_season(season)
+    candidates = []
+    if short:
+        candidates.append(f"{sport}_basketball_all_states_{short}.json")
+    candidates.append(f"{sport}_basketball_all_states.json")
+
+    index: dict[str, list[tuple[str, str]]] = {}
+    used_file = None
+    for fname in candidates:
+        path = os.path.join(script_dir, fname)
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        used_file = path
+        for sd in data.get("byState", {}).values():
+            for d in sd.get("regions", {}).values():
+                for t in d.get("teams", []):
+                    url = t.get("teamUrl", "")
+                    if not url:
+                        continue
+                    tid = re.sub(r"https?://(?:www\.)?maxpreps\.com/", "", url).rstrip("/")
+                    tname = t.get("teamName", "") or ""
+                    # Clean stored corruptions like 'Aandm' → 'A&M'.
+                    tname = tname.replace("Aandm", "A&M").replace("aandm", "a&m")
+                    for slug in _candidate_slugs_for_team(tid, tname):
+                        index.setdefault(slug, []).append((tid, tname))
+        break  # first match wins
+    return index, used_file
+
+
+def _get_opp_index(sport, season):
+    """Cached accessor for the opponent index. Safe across threads."""
+    key = (sport or "boys", _short_season(season))
+    with _opp_index_lock:
+        if key not in _opp_index_cache:
+            idx, used = _build_opp_index(sport, season)
+            _opp_index_cache[key] = idx
+            if used:
+                print(f"Opponent index loaded from {os.path.basename(used)} "
+                      f"({len(idx):,} slugs).")
+            else:
+                print(f"[WARN] No master file found for {sport}/{season} — "
+                      f"opponents will use short slugs only.")
+        return _opp_index_cache[key]
+
+
+def _resolve_opponent(opp_slug, our_team_id, opp_index):
+    """Look up opp_slug in the master index.
+
+    Returns (canonical_team_id, canonical_team_name). If the slug isn't in
+    the master file (out-of-state team we haven't catalogued, etc.), returns
+    the short slug + Title-cased name as a graceful degradation — never
+    leaves the opponent section blank.
+    """
+    fallback_name = opp_slug.replace("-", " ").title() if opp_slug else ""
+    if not opp_slug or not opp_index:
+        return opp_slug, fallback_name
+    matches = opp_index.get(opp_slug, [])
+    if not matches:
+        return opp_slug, fallback_name
+    if len(matches) == 1:
+        return matches[0]
+    # Multiple master teams share this slug (e.g. duplicate city names). Prefer
+    # a match in the same state as our own team if possible.
+    our_state = our_team_id.split("/", 1)[0] if our_team_id else ""
+    same_state = [m for m in matches if m[0].split("/", 1)[0] == our_state]
+    if len(same_state) == 1:
+        return same_state[0]
+    # Still ambiguous — take the first deterministic match.
+    return matches[0]
+
+
+def _opp_slug_from_url(game_url, team_id):
+    """Derive the opponent's canonical slug from the game URL.
+
+    Game URLs are always /games/{date}/{sport}/{slugA}-vs-{slugB}.htm where
+    one of slugA/slugB matches our team. This is the SINGLE source of truth
+    for who the opponent is — it's MaxPreps' canonical naming, never an
+    abbreviation or fallback.
+
+    Returns the opponent's slug, or None if the URL doesn't follow the
+    expected `{a}-vs-{b}.htm` pattern (rare — tournament games etc.).
+    """
+    if not game_url:
+        return None
+    m = re.search(r"/games/[^/]+/[^/]+/(.+?)\.htm", game_url, re.I)
+    if not m:
+        return None
+    matchup = m.group(1).lower()
+    parts = matchup.split("-vs-")
+    if len(parts) != 2:
+        return None
+    a, b = parts[0].strip("-"), parts[1].strip("-")
+    if not a or not b:
+        return None
+    # Decide which side is us using slugs derived from our team_id.
+    our_slugs = _our_team_slugs(team_id)
+    a_us = _slug_matches_us(a, our_slugs)
+    b_us = _slug_matches_us(b, our_slugs)
+    if a_us and not b_us:
+        return b
+    if b_us and not a_us:
+        return a
+    if a_us and b_us:
+        # Both sides match our team_id (extremely rare: e.g. our slug is a
+        # substring of the opponent's). Pick the one with the shorter overlap
+        # since the longer one is more specifically us.
+        return b if len(a) >= len(b) else a
+    # Neither side matched our team_id — URL probably uses a name we can't
+    # recognise. No fallback by design.
+    return None
+
+
+def _our_team_slugs(team_id):
+    """Return the set of candidate slugs that may represent us in a game URL.
+
+    Our canonical team_id has the shape:  tx/CITY/TEAM-SLUG/basketball[/girls]
+    MaxPreps' game-URL slug for us is often one of:
+      - CITY              (most common, e.g. 'milford')
+      - TEAM-SLUG         ('milford-bulldogs')
+      - TEAM-SLUG without trailing mascot word ('milford-bulldogs' → 'milford')
+      - CITY+TEAM-SLUG    rare
+    """
+    parts = (team_id or "").split("/")
+    slugs = set()
+    if len(parts) >= 2 and parts[1]:
+        slugs.add(parts[1])                                # city
+    if len(parts) >= 3 and parts[2]:
+        slugs.add(parts[2])                                # full team slug
+        no_mascot = parts[2].rsplit("-", 1)[0]             # drop trailing word
+        if no_mascot:
+            slugs.add(no_mascot)
+    return slugs
+
+
+def _slug_matches_us(candidate, our_slugs):
+    """True if `candidate` (from the URL) represents our team.
+
+    Match is exact first, then a directional substring match (so 'huntington'
+    matches our 'huntington-red-devils' team_slug, and vice versa). We avoid
+    any reverse fuzzy match against arbitrary text — only candidates already
+    in `our_slugs` participate."""
+    if not candidate:
+        return False
+    if candidate in our_slugs:
+        return True
+    for s in our_slugs:
+        if s and (s == candidate or candidate.startswith(s + "-")
+                  or s.startswith(candidate + "-")):
+            return True
+    return False
+
+
+def _is_our_team(page_name, our_slugs):
+    """True if `page_name` (the text in a div's span.school) refers to us.
+
+    page_name is title-case (e.g. 'Huntington', 'Anderson Shiro'). We compare
+    its slug form against the canonical slugs derived from our team_id.
+    """
+    if not page_name:
+        return False
+    return _slug_matches_us(_slugify(page_name), our_slugs)
+
+
+def parse_game_page(soup, game_url, our_team_name, team_id, opp_index=None):
     """
     Parse all div.stat-category elements on a rendered game page.
 
-    Each div has:
-      span.school  → team name
-      h4           → category label (Shooting / Totals / Misc Totals; absent
-                      for Detailed Shooting — identified from column headers)
-      table tbody  → player rows  (Team Totals are in tfoot, safely excluded)
+    Each div contains stats for ONE category (Shooting / Detailed Shooting /
+    Totals / Misc Totals). Inside a div MaxPreps may include:
+      - One <span class="school"> at the top showing the first team's name.
+      - One <h4> + <table> per team that uploaded stats for this category.
+        Up to TWO tables (one per team). Both teams' tables share the div.
+      - Or a <div class="no-data"> message and no table at all.
 
-    Returns a dict:
+    The opponent's identity is determined from the game URL (the canonical
+    `{a}-vs-{b}.htm` slug), NOT from any text scraped from the page body —
+    that way abbreviations like 'HSIFW' or 'NCA' that appear in the rendered
+    page never leak into our output. The opp_index argument (built from the
+    master team-list file) is then used to resolve the URL slug to the team's
+    FULL canonical team_id and team_name — same shape as our own team's.
+
+    Returns:
     {
-      "team_name":     <our team name as found on the page>,
-      "opp_name":      <opponent team name, or "" if not found>,
+      "team_name":   <our canonical team name, with mascot>,
+      "opp_name":    <opponent's canonical team name, with mascot>,
+      "opp_id":      <opponent's canonical team_id, e.g. 'tx/san-augustine/san-augustine-wolves/basketball/girls'>,
       "shooting":          {"team": {"players":[...]}, "opponent": {"players":[...]}},
       "detailed_shooting": {...},
       "totals":            {...},
       "misc":              {...},
     }
-    or None if no stat sections are found.
+    or None if no stat sections are present anywhere on the page.
     """
     stat_divs = soup.select("div.stat-category")
     if not stat_divs:
         return None
 
-    # Group divs by team name
-    team_data = {}   # team_name → {category → [players]}
+    # ── Opponent identity from URL (single source of truth) ──────────────
+    our_slugs = _our_team_slugs(team_id)
+    opp_slug_raw = _opp_slug_from_url(game_url, team_id) or ""
+    # Resolve to canonical team_id + team_name using the master-list index.
+    # Falls back to (slug, Title-cased slug) when the opponent isn't in any
+    # master file we have on disk.
+    opp_id, opp_name = _resolve_opponent(opp_slug_raw, team_id, opp_index)
+
+    # ── Per-category storage ─────────────────────────────────────────────
+    team_cats = {c: [] for c in ("shooting", "detailed_shooting", "totals", "misc")}
+    opp_cats  = {c: [] for c in ("shooting", "detailed_shooting", "totals", "misc")}
+    found_any = False
 
     for div in stat_divs:
-        # Skip divs that only contain a "not entered" message
-        if div.select_one("div.no-data") and not div.find("table"):
-            continue
-        table = div.find("table")
-        if not table:
-            continue
+        tables = div.find_all("table")
+        if not tables:
+            continue  # 'no-data' or empty div — skip
 
-        # Team name from span.school
+        # The single span.school inside the div names the FIRST team's table.
+        # If that text refers to us, table[0] is our data and table[1] (if any)
+        # is the opponent's. Otherwise the layout is flipped (only happens
+        # when we didn't upload but the opponent did — page renders from the
+        # uploader's perspective).
         school_el = div.select_one("span.school")
-        team_name = school_el.get_text(strip=True) if school_el else ""
-        if not team_name:
-            continue
+        first_team_school = school_el.get_text(strip=True) if school_el else ""
+        first_is_us = _is_our_team(first_team_school, our_slugs)
 
-        # Category from column headers
-        headers = [th.get_text(strip=True)
-                   for th in table.select("thead th, thead td")]
-        category = _identify_category(headers)
-        if not category:
-            continue
+        for idx, table in enumerate(tables):
+            headers = [th.get_text(strip=True)
+                       for th in table.select("thead th, thead td")]
+            category = _identify_category(headers)
+            if not category:
+                continue
+            players = _parse_players(table, category)
+            if not players:
+                continue
+            # idx==0 → first_team_school; idx==1 → the other team.
+            if (idx == 0 and first_is_us) or (idx == 1 and not first_is_us):
+                team_cats[category].extend(players)
+            else:
+                opp_cats[category].extend(players)
+            found_any = True
 
-        players = _parse_players(table, category)
-        if team_name not in team_data:
-            team_data[team_name] = {}
-        team_data[team_name][category] = players
-
-    if not team_data:
+    if not found_any:
         return None
 
-    # Identify our team vs opponent by fuzzy name match
-    our_norm = our_team_name.lower().strip()
-
-    def _matches(name):
-        n = name.lower().strip()
-        return n == our_norm or our_norm in n or n in our_norm
-
-    team_key = next((n for n in team_data if _matches(n)), None)
-
-    if not team_key:
-        # Our team's stats are not on this page — all found data belongs to the
-        # opponent. Putting it in the team section would create ghost records
-        # (opponent players accumulated under the wrong team ID).
-        opp_key = next(iter(team_data)) if team_data else None
-        result = {
-            "team_name": our_team_name,
-            "opp_name":  opp_key or "",
-        }
-        for cat in ("shooting", "detailed_shooting", "totals", "misc"):
-            result[cat] = {
-                "team":     {"players": []},
-                "opponent": {"players": team_data.get(opp_key, {}).get(cat, [])
-                             if opp_key else []},
-            }
-        return result
-
-    opp_key = next((n for n in team_data if n != team_key), None)
-
     result = {
-        "team_name": team_key,
-        "opp_name":  opp_key or "",
+        "team_name": our_team_name,
+        "opp_name":  opp_name,
+        "opp_id":    opp_id,
     }
     for cat in ("shooting", "detailed_shooting", "totals", "misc"):
         result[cat] = {
-            "team":     {"players": team_data.get(team_key, {}).get(cat, [])},
-            "opponent": {"players": team_data.get(opp_key,  {}).get(cat, [])
-                         if opp_key else []},
+            "team":     {"players": team_cats[cat]},
+            "opponent": {"players": opp_cats[cat]},
         }
     return result
 
 
-def _scoreline_teams(soup):
-    """
-    Extract (home_team_name, away_team_name) from the score table at the
-    top of the page — used to populate opponent name when stat-category
-    divs only show one team.
-    """
-    for table in soup.find_all("table"):
-        rows = table.select("tbody tr")
-        if len(rows) >= 2:
-            cells0 = [td.get_text(strip=True) for td in rows[0].find_all(["td","th"])]
-            cells1 = [td.get_text(strip=True) for td in rows[1].find_all(["td","th"])]
-            if cells0 and cells1 and cells0[0] and cells1[0]:
-                name0, name1 = cells0[0], cells1[0]
-                # Quick sanity: team names are text, scores are digits
-                if not name0.isdigit() and not name1.isdigit():
-                    return name0, name1
-    return "", ""
-
-
 # ── Game scraping ─────────────────────────────────────────────────────────────
 
-def scrape_game(game_url, guid, ssid, our_team_name, team_id):
+def scrape_game(game_url, guid, ssid, our_team_name, team_id, opp_index=None):
     """
     Fetch and parse one game's box score.
+
+    opp_index is the slug → canonical-team-id map produced by _get_opp_index.
+    Passed through to parse_game_page so opponent records carry the FULL
+    canonical team_id and team_name (e.g. 'tx/san-augustine/san-augustine-
+    wolves/basketball/girls' + 'San Augustine Wolves'), matching the shape
+    of our own team's record.
 
     Returns a record dict compatible with Accumulation_data.py, or None
     if the page could not be fetched or has no stat-category sections.
@@ -498,34 +693,24 @@ def scrape_game(game_url, guid, ssid, our_team_name, team_id):
         print(f"    [WARN] fetch failed for {game_url[-55:]}: {e}")
         return None
 
-    page = parse_game_page(soup, our_team_name)
+    # Opponent identity comes from the canonical game URL — never guessed.
+    # Pass the final redirected URL since boxscore.aspx redirects to the
+    # public /games/.../{a}-vs-{b}.htm form that contains the slugs.
+    page = parse_game_page(soup, r.url, our_team_name, team_id, opp_index)
     if not page:
         return None      # game has no stat-category content
-
-    # Opponent name: prefer what the stat parser found; fall back to scoreline
-    opp_name = page["opp_name"]
-    if not opp_name:
-        t1, t2 = _scoreline_teams(soup)
-        our_norm = our_team_name.lower().strip()
-        if t1.lower().strip() == our_norm or our_norm in t1.lower():
-            opp_name = t2
-        else:
-            opp_name = t1
 
     # Game date from the final (redirected) URL
     date_m = re.search(r"/(\d{1,2}-\d{1,2}-\d{4})/", r.url)
     game_date = date_m.group(1) if date_m else ""
-
-    # Stable opponent ID: normalised slug of opponent name
-    opp_id = re.sub(r"[^a-z0-9]+", "-", opp_name.lower()).strip("-")
 
     return {
         "contest_id":        guid,
         "game_url":          r.url,
         "game_date":         game_date,
         "is_deleted":        False,
-        "team":     {"team_id": team_id,  "team_name": our_team_name},
-        "opponent": {"team_id": opp_id,   "team_name": opp_name},
+        "team":     {"team_id": team_id,        "team_name": our_team_name},
+        "opponent": {"team_id": page["opp_id"], "team_name": page["opp_name"]},
         "shooting":          page["shooting"],
         "detailed_shooting": page["detailed_shooting"],
         "totals":            page["totals"],
@@ -569,12 +754,15 @@ def _name_from_url(team_url, fallback=""):
 
 # ── Core scraping logic (callable from gap finder or standalone) ──────────────
 
-def _scrape_team(team, season_suffix=None):
+def _scrape_team(team, season_suffix=None, opp_index=None):
     """Worker: scrape one team's full set of games. Returns
     (team_id, team_name, team_url, games_list, error_dict_or_None).
 
     season_suffix (e.g. '24-25') makes the schedule fetch target a past
     season. None = current season.
+
+    opp_index is the slug→canonical map from the master team list, used so
+    every game record carries the opponent's FULL canonical team_id and name.
 
     All HTTP work happens here — no shared state is touched. Caller commits
     the returned games/error under a lock.
@@ -662,7 +850,7 @@ def _scrape_team(team, season_suffix=None):
             continue
         for _attempt in range(3):
             try:
-                record = scrape_game(game_url, guid, ssid, team_name, team_id)
+                record = scrape_game(game_url, guid, ssid, team_name, team_id, opp_index)
                 if isinstance(record, dict) and record.get("_404"):
                     break
                 if record:
@@ -714,8 +902,13 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026", wor
     # Without this the schedule fetch URL omits the season and MaxPreps falls
     # back to the current season — silently scraping wrong-season games.
     season_suffix = _short_season(season)
+    # Build the slug→canonical-team-id index so opponent records carry the
+    # full canonical team_id / team_name (e.g. 'tx/san-augustine/san-augustine-
+    # wolves/basketball/girls' instead of just 'san-augustine'). Cached.
+    opp_index = _get_opp_index(sport, season)
     print(f"Teams to process : {total_teams}  (full={len(full_b)} + partial={len(partial_b)} + no-data={len(none_b)})")
     print(f"Season           : {season} (URL suffix: {season_suffix or '(current)'})")
+    print(f"Opp index size   : {len(opp_index):,} slugs")
     print(f"Workers          : {workers}\n")
 
     # Warm the build ID cache before fanning out so all threads share one fetch.
@@ -776,7 +969,7 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026", wor
                         print(f"  [WARN] Periodic save failed: {save_e}")
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_scrape_team, t, season_suffix): t for t in teams_to_do}
+            futures = {pool.submit(_scrape_team, t, season_suffix, opp_index): t for t in teams_to_do}
             for fut in as_completed(futures):
                 try:
                     team_id, team_name, team_url, games, error = fut.result()

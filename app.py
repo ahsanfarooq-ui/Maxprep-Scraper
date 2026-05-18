@@ -9,7 +9,7 @@ Expected runtime for 1800+ teams: ~30–45 minutes (vs 7 hours).
 
 
 HOW TO USE:::::===========================================================
-python app.py --state AL --sport girls --season 2024-2025   
+python app.py --state TX --sport girls --season 2025-2026   
 python app.py --state AL --sport boys --season 2024-2025
 ==========================================================================
 """

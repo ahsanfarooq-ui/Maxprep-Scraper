@@ -47,6 +47,52 @@ def _slugify(name):
     """Match the slug scheme used by scrape_box_scores.py for opponent team_ids."""
     return re.sub(r'[^a-z0-9]+', '-', (name or '').lower()).strip('-')
 
+
+def _gaps_path_for(input_file):
+    """Derive the matching data-gaps file path from a box-scores input path.
+
+    e.g. 'tx_box_scores_girls_2025_2026.json' → 'tx_data_gaps_girls_2025_2026.json'.
+    Returns None if the input path doesn't follow the expected pattern OR
+    the derived gaps file doesn't exist next to the input.
+    """
+    if not input_file:
+        return None
+    folder = os.path.dirname(os.path.abspath(input_file)) or "."
+    fname = os.path.basename(input_file)
+    if "box_scores" not in fname:
+        return None
+    candidate = os.path.join(folder, fname.replace("box_scores", "data_gaps"))
+    return candidate if os.path.exists(candidate) else None
+
+
+def _load_games_checked_lookup(gaps_file):
+    """Build {(team_id, team_name): gamesChecked} from a data-gaps file.
+
+    team_id is derived from teamUrl by stripping the maxpreps.com prefix and
+    trailing slash so it matches the canonical team_id we use in the
+    accumulated-stats output. team_name is matched exactly (the gap finder
+    now writes URL-derived names, so they match what the accumulator emits)."""
+    if not gaps_file or not os.path.exists(gaps_file):
+        return {}
+    try:
+        with open(gaps_file, encoding='utf-8') as f:
+            gaps = json.load(f)
+    except Exception as e:
+        print(f"  [WARN] Could not read gaps file {gaps_file}: {e}")
+        return {}
+    lookup = {}
+    for bucket in ('teamsFullBoxScores', 'teamsPartialBoxScores', 'teamsNoBoxScores'):
+        for t in gaps.get(bucket, []):
+            url = t.get('teamUrl', '')
+            if not url:
+                continue
+            tid = url.replace('https://www.maxpreps.com/', '').rstrip('/')
+            tname = (t.get('teamName') or '').replace('Aandm', 'A&M').replace('aandm', 'a&m')
+            gc = t.get('gamesChecked')
+            if tid and tname and gc is not None:
+                lookup[(tid, tname)] = gc
+    return lookup
+
 def safe_float(value):
     try:
         if value is None:
@@ -87,6 +133,17 @@ def process_stats(input_file=None, output_file=None):
         print(f"  Master name lookup loaded: {len(master_names)} teams.")
     else:
         print("  Master name lookup not found — team names will use box score values.")
+
+    # Load gap-finder "gamesChecked" counts so each team_total record can carry
+    # a TotalGamesChecked field alongside its GP. Lets scouting reports show
+    # phrases like "based on 28 of 37 games" without needing two files.
+    gaps_path = _gaps_path_for(input_file)
+    games_checked_lookup = _load_games_checked_lookup(gaps_path)
+    if games_checked_lookup:
+        print(f"  Games-checked lookup loaded from {os.path.basename(gaps_path)}: "
+              f"{len(games_checked_lookup)} teams.")
+    else:
+        print("  Games-checked lookup not found — team_total records will not include TotalGamesChecked.")
 
     # A "scraped" team has a full canonical path ID (e.g. tx/city/team/basketball).
     # The scraper always generates SHORT slug IDs for opponents (regardless of whether
@@ -414,10 +471,23 @@ def process_stats(input_file=None, output_file=None):
                 
             return res
 
-        # Add team totals object
-        final_output_list.append(format_record("Season Totals", season_totals_accumulated, "team_total"))
-        
-        # Add individual player objects
+        # Add team totals object — annotated with TotalGamesChecked from the
+        # gap-finder file when we have a match. We only add this to team_total
+        # rows (not players) and only when a match exists, so player records
+        # and unmatched team_totals stay untouched.
+        season_record = format_record("Season Totals", season_totals_accumulated, "team_total")
+        gc = games_checked_lookup.get((t_id, team_name))
+        if gc is not None:
+            # Reinsert keys in order so TotalGamesChecked lands right after GP.
+            new_rec = {}
+            for k, v in season_record.items():
+                new_rec[k] = v
+                if k == 'GP':
+                    new_rec['TotalGamesChecked'] = gc
+            season_record = new_rec
+        final_output_list.append(season_record)
+
+        # Add individual player objects (TotalGamesChecked NOT added to these)
         for p_name, p_acc in players_accumulated.items():
             final_output_list.append(format_record(p_name, p_acc, "player"))
 
