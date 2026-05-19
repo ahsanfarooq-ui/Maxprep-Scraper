@@ -355,6 +355,94 @@ def _slugify(text):
     return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
 
 
+# ── Punctuation-tolerant name matching ──────────────────────────────────────
+# span.school on box-score pages renders short school names that don't always
+# match the canonical names byte-for-byte: MaxPreps sometimes uses a hyphen
+# where the canonical name has a space (e.g. 'Anderson-Shiro' vs 'Anderson
+# Shiro Fighting Owls'), or apostrophes / dots that differ from the master
+# list. Normalising both sides to "alphanumerics separated by single spaces"
+# makes the prefix match robust to all those variants.
+
+_NORM_PUNCT = re.compile(r"[^a-z0-9]+")
+
+
+def _norm_name(text):
+    """Lowercase + collapse any run of punctuation/whitespace to a single space."""
+    return _NORM_PUNCT.sub(" ", (text or "").lower()).strip()
+
+
+def _school_matches_team(school_text, team_name):
+    """True if `school_text` (the literal span.school text on the page)
+    refers to the team named `team_name` (the canonical full name from the
+    master list). Compares punctuation-normalised forms — so 'Anderson-Shiro'
+    correctly matches 'Anderson Shiro Fighting Owls'.
+
+    Match policy: exact match OR word-boundary prefix (so 'Austin' matches
+    'Austin Maroons' but NOT 'Austinville Eagles')."""
+    if not school_text or not team_name:
+        return False
+    s = _norm_name(school_text)
+    f = _norm_name(team_name)
+    if not s or not f:
+        return False
+    return f == s or f.startswith(s + " ")
+
+
+# ── Page-hyperlink team identification (deterministic) ──────────────────────
+# Every box-score page starts with a scoreline widget that links to BOTH
+# teams' canonical pages. We take the first two unique canonical team_ids
+# we encounter in document order as the matchup pair. This avoids URL-slug
+# guesswork that breaks when a city has multiple teams (e.g. Austin Bowie
+# vs Austin Maroons → URL 'austin-vs-bowie' is ambiguous via slugs but
+# unambiguous via hyperlinks).
+
+_TEAM_LINK_RE = re.compile(
+    r"^/([a-z]{2})/([^/]+)/([^/]+)/basketball(?:/(boys|girls))?(?:/[^/]*)?/?$",
+    re.I,
+)
+
+
+def _canonical_team_ids_on_page(soup, limit=2):
+    """Returns the first `limit` unique canonical team_ids found in document
+    order in any <a href> on the page."""
+    seen = []
+    for a in soup.find_all("a", href=True):
+        href = a["href"].split("?")[0].split("#")[0]
+        m = _TEAM_LINK_RE.match(href)
+        if m:
+            gp = f"/{m.group(4).lower()}" if m.group(4) else ""
+            tid = (f"{m.group(1).lower()}/{m.group(2).lower()}/"
+                   f"{m.group(3).lower()}/basketball{gp}")
+            if tid not in seen:
+                seen.append(tid)
+                if len(seen) >= limit:
+                    break
+    return seen
+
+
+def _team_name_from_id(team_id):
+    """Fallback canonical team_name from a team_id slug.
+    'tx/austin/austin-maroons/basketball/girls' → 'Austin Maroons'."""
+    parts = (team_id or "").split("/")
+    if len(parts) >= 3:
+        name = parts[2].replace("-", " ").title()
+        return name.replace("Aandm", "A&M").replace("aandm", "a&m")
+    return team_id or ""
+
+
+def _id_to_name_from_opp_index(opp_index):
+    """Build {team_id: team_name} from the slug-keyed opp_index. Used to
+    canonicalise the opponent's team_name when we got its team_id from page
+    hyperlinks (not from slug matching)."""
+    out = {}
+    if not opp_index:
+        return out
+    for matches in opp_index.values():
+        for tid, tname in matches:
+            out.setdefault(tid, tname)
+    return out
+
+
 # ── Opponent canonical-name index ──────────────────────────────────────────
 # Game URLs give us a SHORT opponent slug (e.g. 'san-augustine'). To put the
 # full canonical team_id ('tx/san-augustine/san-augustine-wolves/basketball/
@@ -597,13 +685,28 @@ def parse_game_page(soup, game_url, our_team_name, team_id, opp_index=None):
     if not stat_divs:
         return None
 
-    # ── Opponent identity from URL (single source of truth) ──────────────
-    our_slugs = _our_team_slugs(team_id)
-    opp_slug_raw = _opp_slug_from_url(game_url, team_id) or ""
-    # Resolve to canonical team_id + team_name using the master-list index.
-    # Falls back to (slug, Title-cased slug) when the opponent isn't in any
-    # master file we have on disk.
-    opp_id, opp_name = _resolve_opponent(opp_slug_raw, team_id, opp_index)
+    # ── Opponent identity from PAGE HYPERLINKS (deterministic) ───────────
+    # Box-score pages start with a scoreline widget that links to both teams'
+    # canonical pages. Using those hyperlinks is unambiguous — it's immune to
+    # the URL-slug ambiguity that breaks for same-city opponents like
+    # 'austin-vs-bowie.htm' (Austin Bowie vs Austin Maroons, both in Austin).
+    page_tids = _canonical_team_ids_on_page(soup, limit=2)
+    opp_id = ""
+    if team_id in page_tids:
+        opp_id = next((t for t in page_tids if t != team_id), "")
+
+    # If hyperlinks didn't put us in the matchup pair (rare — page structure
+    # change or missing links), fall back to the URL-slug + master-index path.
+    if not opp_id:
+        opp_slug_raw = _opp_slug_from_url(game_url, team_id) or ""
+        opp_id_fallback, opp_name_fallback = _resolve_opponent(opp_slug_raw, team_id, opp_index)
+        opp_id = opp_id_fallback
+        opp_name = opp_name_fallback
+    else:
+        # We have a canonical team_id from the page. Look up its full team_name
+        # in the master index; if missing, derive from the slug.
+        id_to_name = _id_to_name_from_opp_index(opp_index)
+        opp_name = id_to_name.get(opp_id) or _team_name_from_id(opp_id)
 
     # ── Per-category storage ─────────────────────────────────────────────
     team_cats = {c: [] for c in ("shooting", "detailed_shooting", "totals", "misc")}
@@ -615,14 +718,21 @@ def parse_game_page(soup, game_url, our_team_name, team_id, opp_index=None):
         if not tables:
             continue  # 'no-data' or empty div — skip
 
-        # The single span.school inside the div names the FIRST team's table.
-        # If that text refers to us, table[0] is our data and table[1] (if any)
-        # is the opponent's. Otherwise the layout is flipped (only happens
-        # when we didn't upload but the opponent did — page renders from the
-        # uploader's perspective).
+        # span.school names the FIRST team's table. Compare against the
+        # canonical names of BOTH teams (with punctuation normalisation) so
+        # 'Anderson-Shiro' correctly matches 'Anderson Shiro Fighting Owls'.
         school_el = div.select_one("span.school")
-        first_team_school = school_el.get_text(strip=True) if school_el else ""
-        first_is_us = _is_our_team(first_team_school, our_slugs)
+        first_text = school_el.get_text(strip=True) if school_el else ""
+        first_is_us  = _school_matches_team(first_text, our_team_name)
+        first_is_opp = _school_matches_team(first_text, opp_name) if opp_name else False
+        # If both names match (rare — e.g. both teams share a common prefix),
+        # prefer exact-match over prefix-match to disambiguate.
+        if first_is_us and first_is_opp:
+            s = _norm_name(first_text)
+            if _norm_name(our_team_name) == s and _norm_name(opp_name) != s:
+                first_is_opp = False
+            elif _norm_name(opp_name) == s and _norm_name(our_team_name) != s:
+                first_is_us = False
 
         for idx, table in enumerate(tables):
             headers = [th.get_text(strip=True)
@@ -633,8 +743,16 @@ def parse_game_page(soup, game_url, our_team_name, team_id, opp_index=None):
             players = _parse_players(table, category)
             if not players:
                 continue
-            # idx==0 → first_team_school; idx==1 → the other team.
-            if (idx == 0 and first_is_us) or (idx == 1 and not first_is_us):
+            # First table = first_text's team. Subsequent tables = the OTHER team.
+            if idx == 0:
+                belongs_to_us = first_is_us and not first_is_opp
+            else:
+                belongs_to_us = (not first_is_us) and first_is_opp
+                # If first_text still matches both (after disambiguation), idx 1+
+                # is by elimination the other team.
+                if first_is_us and first_is_opp:
+                    belongs_to_us = (idx != 0)
+            if belongs_to_us:
                 team_cats[category].extend(players)
             else:
                 opp_cats[category].extend(players)
@@ -645,8 +763,8 @@ def parse_game_page(soup, game_url, our_team_name, team_id, opp_index=None):
 
     result = {
         "team_name": our_team_name,
-        "opp_name":  opp_name,
-        "opp_id":    opp_id,
+        "opp_name":  opp_name or "",
+        "opp_id":    opp_id or "",
     }
     for cat in ("shooting", "detailed_shooting", "totals", "misc"):
         result[cat] = {

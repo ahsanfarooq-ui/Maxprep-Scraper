@@ -198,11 +198,79 @@ def get_game_entries(contests):
     return entries
 
 def _check_soup(soup, team_name):
+    """Legacy quick check — true if the page has ANY stat section and our
+    team isn't explicitly flagged as 'not entered'. Kept for compatibility
+    only; the gap finder now uses _classify_game (below) which gives a
+    proper 4-bucket per-game classification."""
     stat_sections = soup.select("div.stat-category")
     no_data_msgs  = [el.get_text(strip=True).lower() for el in soup.select("div.no-data")]
     norm = team_name.lower().strip()
     team_not_entered = any(norm in msg and "not entered" in msg for msg in no_data_msgs)
     return bool(stat_sections) and not team_not_entered
+
+
+def _classify_game(soup, final_url, our_team_name, our_team_id, opp_index):
+    """Classify a single game's box-score page into one of:
+        'full'      → both teams uploaded stats
+        'team_only' → only OUR team uploaded
+        'opp_only'  → only the OPPONENT uploaded
+        'no_data'   → neither team uploaded any player rows
+
+    Reuses the same parser the box-score scraper uses, so the gap finder's
+    per-game classification matches what the downstream scraper will
+    actually capture.
+
+    Returns a dict {classification, date, url, opponent_team_id, opponent_team_name}
+    or None if the page couldn't be parsed at all.
+    """
+    from scrape_box_scores import (
+        parse_game_page,
+        _canonical_team_ids_on_page,
+        _id_to_name_from_opp_index,
+        _team_name_from_id,
+    )
+
+    date_m = re.search(r"/(\d{1,2}-\d{1,2}-\d{4})/", final_url)
+    date = date_m.group(1) if date_m else ""
+
+    page = parse_game_page(soup, final_url, our_team_name, our_team_id, opp_index)
+    if page is not None:
+        has_team = any(len(page[c]["team"]["players"]) > 0
+                       for c in ("shooting", "detailed_shooting", "totals", "misc"))
+        has_opp = any(len(page[c]["opponent"]["players"]) > 0
+                      for c in ("shooting", "detailed_shooting", "totals", "misc"))
+        if has_team and has_opp:
+            cls = "full"
+        elif has_team:
+            cls = "team_only"
+        elif has_opp:
+            cls = "opp_only"
+        else:
+            cls = "no_data"
+        return {
+            "classification":     cls,
+            "date":               date,
+            "url":                final_url,
+            "opponent_team_id":   page["opp_id"],
+            "opponent_team_name": page["opp_name"],
+        }
+
+    # parse_game_page returned None → no stat-category divs at all.
+    # Still try to identify the opponent so the no-data entry is informative.
+    page_tids = _canonical_team_ids_on_page(soup, limit=2)
+    opp_id = next((t for t in page_tids if t != our_team_id), "")
+    if opp_id:
+        id_to_name = _id_to_name_from_opp_index(opp_index)
+        opp_name = id_to_name.get(opp_id) or _team_name_from_id(opp_id)
+    else:
+        opp_id = opp_name = ""
+    return {
+        "classification":     "no_data",
+        "date":               date,
+        "url":                final_url,
+        "opponent_team_id":   opp_id,
+        "opponent_team_name": opp_name,
+    }
 
 # ─── Workers ──────────────────────────────────────────────────────────────────
 
@@ -227,14 +295,27 @@ def fetch_sched_worker(team, season_suffix=None):
         return team, get_game_entries(contests)
     return team, None
 
-def check_game_worker(game_url, guid, ssid, team_name):
+def check_game_worker(game_url, guid, ssid, team_name, team_id=None, opp_index=None):
+    """Fetch one game's box-score page and classify it into one of four
+    buckets (full / team_only / opp_only / no_data). Returns a dict with the
+    classification + date + opponent identity + final URL, or None on a
+    fetch error.
+
+    team_id and opp_index are required for the 4-bucket classification; if
+    either is missing we fall back to the legacy True/False semantics so
+    older callers keep working."""
     time.sleep(DELAY)
     url = (f"https://www.maxpreps.com/local/stats/boxscore.aspx?contestid={guid}&ssid={ssid}"
            if guid and ssid else game_url)
     try:
         r = _session(json_mode=False).get(url, timeout=20, allow_redirects=True)
         if r.status_code != 200: return None
-        return _check_soup(BeautifulSoup(r.text, "html.parser"), team_name)
+        soup = BeautifulSoup(r.text, "html.parser")
+        if team_id is None:
+            # Legacy mode — preserve old True/False behaviour for any caller
+            # that hasn't been migrated.
+            return _check_soup(soup, team_name)
+        return _classify_game(soup, r.url, team_name, team_id, opp_index)
     except Exception: return None
 
 # ─── Save / Output ────────────────────────────────────────────────────────────
@@ -364,6 +445,13 @@ def main():
     season_suffix = _short_season(args.season)
     print(f"Season URL suffix: {season_suffix or '(current — no suffix)'}")
 
+    # Build the opponent canonical-name index ONCE, then pass it into every
+    # Phase 2 worker. The gap-finder's 4-bucket per-game classification uses
+    # the same scrape_box_scores parser, so opponents are identified
+    # canonically (full team_id + full team_name) in the gaps file too.
+    from scrape_box_scores import _get_opp_index
+    opp_index = _get_opp_index(args.sport, args.season)
+
     # Filter teams for Phase 1
     teams_to_process = [t for t in all_teams if team_url_to_path(t["teamUrl"]) not in processed_teams]
     if teams_to_process:
@@ -419,21 +507,73 @@ def main():
             # silently drop every subsequent team's result.
             try:
                 team, entries = job['team'], job['entries']
-                games_checked, games_with_stats = 0, 0
+                t_id   = team_url_to_path(team["teamUrl"])
+                t_name = team["teamName"]
+                # Per-game classification buckets — populated by check_game_worker
+                # using the same parser as scrape_box_scores so the gap-finder
+                # numbers match what the downstream scraper will actually capture.
+                full_games:     list = []
+                team_only_games: list = []
+                opp_only_games:  list = []
+                no_data_games:   list = []
                 for url, guid, ssid in entries:
-                    res = check_game_worker(url, guid, ssid, team["teamName"])
-                    if res is not None:
-                        games_checked += 1
-                        if res: games_with_stats += 1
+                    res = check_game_worker(url, guid, ssid, t_name, t_id, opp_index)
+                    if res is None or not isinstance(res, dict):
+                        continue   # fetch error or legacy bool — skip
+                    game_rec = {
+                        "date":               res.get("date", ""),
+                        "opponent_team_id":   res.get("opponent_team_id", ""),
+                        "opponent_team_name": res.get("opponent_team_name", ""),
+                        "url":                res.get("url", url),
+                    }
+                    cls = res.get("classification", "no_data")
+                    if   cls == "full":      full_games.append(game_rec)
+                    elif cls == "team_only": team_only_games.append(game_rec)
+                    elif cls == "opp_only":  opp_only_games.append(game_rec)
+                    else:                    no_data_games.append(game_rec)
 
-                entry = {"teamName": team["teamName"], "teamUrl": team["teamUrl"], "region": team["region"],
-                         "gamesChecked": games_checked, "gamesWithStats": games_with_stats, "gamesMissing": games_checked - games_with_stats}
+                games_with_stats = len(full_games) + len(team_only_games) + len(opp_only_games)
+                games_missing    = len(no_data_games)
+                games_checked    = games_with_stats + games_missing
+
+                entry = {
+                    "teamName":       t_name,
+                    "teamUrl":        team["teamUrl"],
+                    "region":         team["region"],
+                    "gamesChecked":   games_checked,
+                    "gamesWithStats": games_with_stats,
+                    "gamesMissing":   games_missing,
+                    "fullDataGames": {
+                        "count": len(full_games),
+                        "note":  "Both teams entered stats.",
+                        "games": full_games,
+                    },
+                    "teamOnlyDataGames": {
+                        "count": len(team_only_games),
+                        "note":  "Only THIS team entered stats; opponent did not.",
+                        "games": team_only_games,
+                    },
+                    "opponentOnlyDataGames": {
+                        "count": len(opp_only_games),
+                        "note":  "Only the OPPONENT entered stats; this team did not.",
+                        "games": opp_only_games,
+                    },
+                    "noDataGames": {
+                        "count": len(no_data_games),
+                        "note":  "NEITHER team entered any stats.",
+                        "games": no_data_games,
+                    },
+                }
 
                 with agg_lock:
-                    if games_checked == 0: no_data.append(entry)
-                    elif games_with_stats == games_checked: full_data.append(entry)
-                    elif games_with_stats > 0: partial_data.append(entry)
-                    else: no_data.append(entry)
+                    # Top-level team bucket (existing semantics, unchanged):
+                    #  - full_data:     every checked game has SOME stats
+                    #  - partial_data:  some games have stats, some don't
+                    #  - no_data:       zero games have stats
+                    if games_checked == 0:           no_data.append(entry)
+                    elif games_missing == 0:         full_data.append(entry)
+                    elif games_with_stats > 0:       partial_data.append(entry)
+                    else:                            no_data.append(entry)
                     processed_teams.add(team_url_to_path(team["teamUrl"]))
 
                     # Print frequent progress
