@@ -491,6 +491,51 @@ def process_stats(input_file=None, output_file=None):
         for p_name, p_acc in players_accumulated.items():
             final_output_list.append(format_record(p_name, p_acc, "player"))
 
+    # ── Zero-stat placeholders for teams the gap finder saw but with no data ──
+    # If a team's gap-finder entry shows gamesChecked > 0 but gamesWithStats = 0
+    # (no team uploaded for any game on their schedule), the team produces zero
+    # box-score records and so never lands in all_teams_data. Without this step
+    # they'd vanish from the accumulated output, which downstream consumers
+    # can't tell apart from "team doesn't exist".
+    #
+    # Emit a team_total row with all stat fields = 0 and TotalGamesChecked set
+    # to whatever the gap finder verified, so scouting-report generators can
+    # render "based on 0 of N games — no data exists on MaxPreps for this team".
+    emitted_team_ids = {r.get('team_id') for r in final_output_list
+                        if r.get('record_type') == 'team_total'}
+    placeholders_added = 0
+    for (t_id, t_name), gc in games_checked_lookup.items():
+        if t_id in emitted_team_ids:
+            continue
+        canonical_name = master_names.get(t_id) or t_name
+        placeholder = {
+            'team_id':     t_id,
+            'team_name':   canonical_name,
+            'record_type': 'team_total',
+            'Name':        'Season Totals',
+            'GP':          0,
+            'TotalGamesChecked': gc,
+            'MPG': 0.0, 'PPG': 0.0, 'DEFR': 0.0, 'OFFR': 0.0,
+            'RPG': 0.0, 'APG': 0.0, 'SPG': 0.0, 'BPG': 0.0,
+            'TPG': 0.0, 'PFPG': 0.0,
+            'Min': 0, 'Pts': 0, 'FGM': 0, 'FGA': 0,
+            'FG%': 0.0, 'PPS': 0.0, 'AFG%': 0.0,
+            '3PM': 0, '3PA': 0, '3P%': 0.0,
+            'FTM': 0, 'FTA': 0, 'FT%': 0.0,
+            '2FGM': 0, '2FGA': 0, '2FG%': 0.0,
+            'OReb': 0, 'DReb': 0, 'Reb': 0, 'Ast': 0,
+            'Stl': 0, 'Blk': 0, 'TO': 0, 'PF': 0,
+            'Ast:TO': 0.0, 'Stl:TO': 0.0, 'Stl:PF': 0.0, 'Blk:PF': 0.0,
+            'Chr': 0, 'Defl': 0, 'TF': 0,
+            'DD': 0, 'TD': 0,
+            'Per_32': None,
+        }
+        final_output_list.append(placeholder)
+        placeholders_added += 1
+    if placeholders_added:
+        print(f"  Emitted {placeholders_added} zero-stat placeholder team_total "
+              f"record(s) for teams whose box scores had no data anywhere.")
+
     tmp = output_file + ".tmp"
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(final_output_list, f, indent=4, ensure_ascii=False)
