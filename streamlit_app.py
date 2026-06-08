@@ -40,6 +40,8 @@ PHASE_LABELS   = [
     "Phase 2 — Gap Analysis",
     "Phase 3 — Scraping Box Scores",
     "Phase 4 — Accumulating Stats",
+    "Phase 5 — Finding Stats-Tab Teams",
+    "Phase 6 — Updating Accumulated File",
 ]
 
 
@@ -97,6 +99,31 @@ def parse_log(line, state):
         state["phase"] = 4
         state["done"]  = int(m.group(1))
         state["total"] = int(m.group(2))
+
+    # Phase 5: find_stats_only_teams.py
+    if "STAGE 4:" in line or "find_stats_only_teams" in line:
+        state["phase"] = 5
+        state["done"]  = 0
+    m = re.search(r"\[\s*(\d+)/\s*(\d+)\]\s+(?:FLAG|skip:|no-stats|CRASH|ok:)", line)
+    if m:
+        state["phase"] = 5
+        state["done"]  = int(m.group(1))
+        state["total"] = int(m.group(2))
+
+    # Phase 6: accumulate_from_stats_tab.py + merge_stats_tab_into_accumulated.py
+    if "STAGE 5:" in line or "accumulate_from_stats_tab" in line:
+        state["phase"] = 6
+        state["done"]  = 0
+    m = re.search(r"\[\s*(\d+)/\s*(\d+)\]\s+(?:OK|skip:|CRASH)\s+\|", line)
+    if m and state.get("phase", 0) >= 5:
+        state["phase"] = 6
+        state["done"]  = int(m.group(1))
+        state["total"] = int(m.group(2))
+    if "STAGE 6:" in line or "merge_stats_tab_into_accumulated" in line:
+        state["phase"] = 6
+    if "PIPELINE COMPLETE" in line:
+        state["phase"] = 6
+        state["done"]  = state.get("total", 1)
 
     return state
 
@@ -199,7 +226,10 @@ def render_progress(ph, state):
     pct   = done / total if total > 0 else 0.0
 
     with ph.container():
-        cols = st.columns(4)
+        # Two rows of three phase chips.
+        row1 = st.columns(3)
+        row2 = st.columns(3)
+        cols = list(row1) + list(row2)
         for i, (col, label) in enumerate(zip(cols, PHASE_LABELS), 1):
             if i < phase:
                 col.success(f"✅ {label}")
@@ -208,10 +238,11 @@ def render_progress(ph, state):
             else:
                 col.info(f"🔒 {label}")
 
+        label_idx = min(max(phase, 1), len(PHASE_LABELS)) - 1
         if total > 0:
-            st.progress(pct, text=f"{PHASE_LABELS[phase-1]}: **{done} / {total} teams** ({pct*100:.1f}%)")
+            st.progress(pct, text=f"{PHASE_LABELS[label_idx]}: **{done} / {total} teams** ({pct*100:.1f}%)")
         else:
-            st.progress(0.0, text=f"{PHASE_LABELS[phase-1] if phase <= 4 else 'Done'}: starting…")
+            st.progress(0.0, text=f"{PHASE_LABELS[label_idx]}: starting…")
 
         team = state.get("team", "")
         if team:
@@ -252,7 +283,7 @@ st.markdown("Select your options and click **Start Scraping** to begin.")
 
 with st.expander("📋 How the scraper works (click to expand)", expanded=False):
     st.markdown("""
-    The scraper runs **4 phases** in sequence. A download button appears as soon as each file is ready.
+    The scraper runs **6 phases** in sequence. A download button appears as soon as each file is ready.
 
     | Phase | What happens | Output File | Approx. Time |
     |-------|-------------|-------------|--------------|
@@ -260,8 +291,10 @@ with st.expander("📋 How the scraper works (click to expand)", expanded=False)
     | **Phase 2** — Gap Analysis | Checks each game for box score availability. Classifies teams as Full / Partial / No stats | `{state}_data_gaps_{sport}_{season}.json` | ~15 min |
     | **Phase 3** — Box Score Scraping | Scrapes all available player box scores for every team | `{state}_box_scores_{sport}_{season}.json` | ~20 min |
     | **Phase 4** — Accumulation | Calculates season totals, per-game averages (PPG, RPG, APG etc.) and percentages for every player | `{state}_accumulated_stats_{sport}_{season}.json` | ~2 min |
+    | **Phase 5** — Stats-Tab Teams | Identifies teams whose game-by-game data is missing but who have season totals on their Stats tab | `{state}_stats_only_teams_{sport}_{season}.json` | ~3 min |
+    | **Phase 6** — Updated Accumulation | Scrapes those teams' Stats tab and merges into the accumulated file (without modifying the original) | `{state}_accumulated_stats_{sport}_{season}_updated.json` (plus `_stats_tab_accumulated_*.json` as a sidecar) | ~2 min |
 
-    > **Total runtime:** 30–45 minutes depending on state size (TX ~1800 teams, smaller states ~300 teams).
+    > **Total runtime:** 35–55 minutes depending on state size (TX ~1800 teams, smaller states ~300 teams).
     """)
 
 st.divider()
@@ -300,6 +333,10 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
             f"{state_lower}_data_gaps_{sport}_{season_fn}.json",
             f"{state_lower}_box_scores_{sport}_{season_fn}.json",
             f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json",
+            f"{state_lower}_stats_only_teams_{sport}_{season_fn}.json",
+            f"{state_lower}_stats_tab_accumulated_{sport}_{season_fn}.json",
+            f"{state_lower}_stats_tab_accumulated_{sport}_{season_fn}_report.json",
+            f"{state_lower}_accumulated_stats_{sport}_{season_fn}_updated.json",
         ]:
             fpath = os.path.join(OUTPUT_DIR, fname)
             if os.path.exists(fpath):
@@ -311,9 +348,13 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
     env["PYTHONUTF8"]       = "1"
 
     log_f = open(LOG_FILE, "wb")
+    # Launch the full 6-stage pipeline (run_full_pipeline.py) so all 6 outputs
+    # land in OUTPUT_DIR via --output-dir. The previous Streamlit version only
+    # ran app.py which covered stages 1–3.
     process = subprocess.Popen(
-        [sys.executable, "-u", "app.py",
-         "--state", state_code, "--sport", sport, "--season", season],
+        [sys.executable, "-u", "run_full_pipeline.py",
+         "--state", state_code, "--sport", sport, "--season", season,
+         "--output-dir", OUTPUT_DIR],
         stdout=log_f,
         stderr=subprocess.STDOUT,
         env=env,
@@ -322,11 +363,16 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
     log_f.close()
 
     save_disk_state({
-        "pid":       process.pid,
-        "label":     f"{STATE_NAMES[state_code]} | {'Boys' if sport=='boys' else 'Girls'} Basketball | {season}",
-        "gaps_file": os.path.join(OUTPUT_DIR, f"{state_lower}_data_gaps_{sport}_{season_fn}.json"),
-        "box_file":  os.path.join(OUTPUT_DIR, f"{state_lower}_box_scores_{sport}_{season_fn}.json"),
-        "acc_file":  os.path.join(OUTPUT_DIR, f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json"),
+        "pid":           process.pid,
+        "label":         f"{STATE_NAMES[state_code]} | {'Boys' if sport=='boys' else 'Girls'} Basketball | {season}",
+        # Phases 1–4 (per-game pipeline)
+        "gaps_file":     os.path.join(OUTPUT_DIR, f"{state_lower}_data_gaps_{sport}_{season_fn}.json"),
+        "box_file":      os.path.join(OUTPUT_DIR, f"{state_lower}_box_scores_{sport}_{season_fn}.json"),
+        "acc_file":      os.path.join(OUTPUT_DIR, f"{state_lower}_accumulated_stats_{sport}_{season_fn}.json"),
+        # Phases 5–6 (stats-tab fallback pipeline)
+        "stats_only_file":  os.path.join(OUTPUT_DIR, f"{state_lower}_stats_only_teams_{sport}_{season_fn}.json"),
+        "stats_tab_file":   os.path.join(OUTPUT_DIR, f"{state_lower}_stats_tab_accumulated_{sport}_{season_fn}.json"),
+        "updated_file":     os.path.join(OUTPUT_DIR, f"{state_lower}_accumulated_stats_{sport}_{season_fn}_updated.json"),
     })
     st.rerun()
 
@@ -346,8 +392,10 @@ if disk is not None:
                 clear_disk_state()
                 st.rerun()
     else:
-        if os.path.exists(disk.get("acc_file", "")):
+        if os.path.exists(disk.get("updated_file", "")):
             st.success(f"🎉 Completed: **{disk['label']}** — Download your files below, then start a new scrape above.")
+        elif os.path.exists(disk.get("acc_file", "")):
+            st.warning(f"⚠️ Pipeline stopped after Phase 4: **{disk['label']}** — partial outputs available below.")
         else:
             st.warning(f"⚠️ Stopped/failed: **{disk['label']}** — Check logs below. You can start a new scrape above.")
 
@@ -358,27 +406,47 @@ if disk is not None:
 
     st.divider()
 
-    # Output files
+    # Output files — 6 files across 2 rows of 3
     st.subheader("Output Files")
-    fc1, fc2, fc3 = st.columns(3)
 
+    # Row 1: Phases 2, 3, 4 (per-game pipeline)
+    fc1, fc2, fc3 = st.columns(3)
     with fc1:
         st.markdown("**Phase 2 — Data Gaps**")
         gaps_ph = st.empty()
         if not show_download(gaps_ph, disk["gaps_file"], "Download Data Gaps"):
             gaps_ph.warning("⏳ Generating...")
-
     with fc2:
         st.markdown("**Phase 3 — Box Scores**")
         box_ph = st.empty()
         if not show_download(box_ph, disk["box_file"], "Download Box Scores"):
             box_ph.info("🔒 Waiting...")
-
     with fc3:
         st.markdown("**Phase 4 — Accumulated Stats**")
         acc_ph = st.empty()
         if not show_download(acc_ph, disk["acc_file"], "Download Accumulated Stats"):
             acc_ph.info("🔒 Waiting...")
+
+    # Row 2: Phases 5, 6 (stats-tab fallback)
+    fc4, fc5, fc6 = st.columns(3)
+    with fc4:
+        st.markdown("**Phase 5 — Stats-Tab Teams**")
+        sot_ph = st.empty()
+        if not show_download(sot_ph, disk.get("stats_only_file", ""),
+                             "Download Stats-Tab Teams"):
+            sot_ph.info("🔒 Waiting...")
+    with fc5:
+        st.markdown("**Phase 5 — Stats-Tab Records**")
+        stab_ph = st.empty()
+        if not show_download(stab_ph, disk.get("stats_tab_file", ""),
+                             "Download Stats-Tab Records"):
+            stab_ph.info("🔒 Waiting...")
+    with fc6:
+        st.markdown("**Phase 6 — Updated Accumulated**")
+        upd_ph = st.empty()
+        if not show_download(upd_ph, disk.get("updated_file", ""),
+                             "Download Updated Accumulated"):
+            upd_ph.info("🔒 Waiting...")
 
     # Logs
     with st.expander("📄 Logs", expanded=running):
