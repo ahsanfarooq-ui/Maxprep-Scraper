@@ -88,12 +88,18 @@ def run_pipeline(state, sport, season, start_at, end_at, workers, output_dir=Non
 
     # Subprocess environment — DATA_DIR redirects stage-1 outputs into the
     # per-state folder. PYTHONIOENCODING forces UTF-8 stdout on Windows.
+    # PYTHONUNBUFFERED=1 is essential when launched from Streamlit: each
+    # child's stdout is otherwise block-buffered to the log file, so live
+    # progress lines don't appear until that child exits.
     env = os.environ.copy()
     env['DATA_DIR'] = state_folder
     env['PYTHONIOENCODING'] = 'utf-8'
     env['PYTHONUTF8'] = '1'
+    env['PYTHONUNBUFFERED'] = '1'
 
-    py = [sys.executable, '-X', 'utf8']
+    # `-u` forces unbuffered stdout/stderr for every child stage. Combined
+    # with PYTHONUNBUFFERED above for libraries that re-fork sub-children.
+    py = [sys.executable, '-u', '-X', 'utf8']
 
     print('=' * 78)
     _ts(f'PIPELINE  state={state_code}  sport={sport}  season={season}')

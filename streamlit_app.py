@@ -346,6 +346,12 @@ if st.button("▶ Start Scraping", type="primary", use_container_width=True, dis
     env["DATA_DIR"]         = OUTPUT_DIR
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"]       = "1"
+    # Critical for live log streaming: forces every Python in the subprocess
+    # tree to flush stdout immediately instead of block-buffering it to the
+    # log file. Without this, the orchestrator's child stages (app.py,
+    # scrape_box_scores.py, etc.) only appear in the log when each child
+    # exits, which makes the live log feel frozen for minutes at a time.
+    env["PYTHONUNBUFFERED"] = "1"
 
     log_f = open(LOG_FILE, "wb")
     # Launch the full 6-stage pipeline (run_full_pipeline.py) so all 6 outputs
