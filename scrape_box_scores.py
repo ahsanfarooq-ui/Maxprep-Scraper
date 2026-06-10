@@ -982,7 +982,7 @@ def _scrape_team(team, season_suffix=None, opp_index=None):
     return team_id, team_name, team_url, team_games, None
 
 
-def run(input_file=None, output_file=None, sport="boys", season="2025-2026", workers=None):
+def run(input_file=None, output_file=None, sport="boys", season="2025-2026", workers=None, run_accumulator=True):
     """
     Scrape all full/partial teams from a gaps JSON file.
     Can be called programmatically or invoked via main().
@@ -1140,6 +1140,13 @@ def run(input_file=None, output_file=None, sport="boys", season="2025-2026", wor
                   f"team {t_players} players, opp {op_players} players")
 
     # ── Accumulation ─────────────────────────────────────────────────────────
+    # Skip when an external orchestrator (APP/pipeline.py) drives accumulation
+    # itself — that pipeline runs stats-tab scraping in between, so the
+    # accumulator must run AFTER both files exist.
+    if not run_accumulator:
+        print("\n[run_accumulator=False] Skipping auto-chained accumulator.")
+        return
+
     accumulated_file = output_file.replace("box_scores", "accumulated_stats")
     print(f"\n{'─' * 60}")
     print(f"Running data accumulation → {accumulated_file}")
@@ -1177,25 +1184,47 @@ def main():
              f"Each worker scrapes one team's games sequentially. "
              f"Raise for speed, lower if you hit rate limits.",
     )
+    parser.add_argument(
+        "--no-accumulate", action="store_true",
+        help="Skip the auto-chained Accumulation_data run. Useful when an "
+             "external orchestrator handles the accumulator stage itself.",
+    )
+    parser.add_argument(
+        "--input", default=None,
+        help="Explicit path to the gaps JSON file. Overrides the CWD lookup. "
+             "Required when running outside the default per-state layout.",
+    )
     args = parser.parse_args()
 
     state_lower = args.state.lower()
     season_fn = args.season.replace("-", "_")
 
-    # Input: tx_data_gaps_boys_2025_2026.json
-    input_file = f"{state_lower}_data_gaps_{args.sport}_{season_fn}.json"
-    if not os.path.exists(input_file):
-        # Fallback to the dash version or old name
-        alt_name = f"{state_lower}_data_gaps_{args.sport}_{args.season}.json"
-        if os.path.exists(alt_name):
-            input_file = alt_name
-        else:
-            fallback = f"{state_lower}_data_gaps.json"
-            if os.path.exists(fallback):
-                input_file = fallback
+    if args.input:
+        input_file = args.input
+        if not os.path.exists(input_file):
+            print(f"Error: --input file {input_file} not found.")
+            sys.exit(1)
+    else:
+        # Default lookup: CWD-relative filename, then DATA_DIR fallback for
+        # state-folder layouts when the orchestrator hasn't passed --input.
+        input_file = f"{state_lower}_data_gaps_{args.sport}_{season_fn}.json"
+        if not os.path.exists(input_file):
+            # DATA_DIR-relative
+            data_dir = os.environ.get("DATA_DIR")
+            if data_dir and os.path.exists(os.path.join(data_dir, input_file)):
+                input_file = os.path.join(data_dir, input_file)
             else:
-                print(f"Error: Input file {input_file} not found.")
-                sys.exit(1)
+                # Fallback to the dash version or old name
+                alt_name = f"{state_lower}_data_gaps_{args.sport}_{args.season}.json"
+                if os.path.exists(alt_name):
+                    input_file = alt_name
+                else:
+                    fallback = f"{state_lower}_data_gaps.json"
+                    if os.path.exists(fallback):
+                        input_file = fallback
+                    else:
+                        print(f"Error: Input file {input_file} not found.")
+                        sys.exit(1)
 
     out = args.output
     if out is None:
@@ -1203,7 +1232,8 @@ def main():
         out = input_file.replace("data_gaps", "box_scores")
 
     run(input_file=input_file, output_file=out, sport=args.sport,
-        season=args.season, workers=args.workers)
+        season=args.season, workers=args.workers,
+        run_accumulator=not args.no_accumulate)
 
 
 if __name__ == "__main__":

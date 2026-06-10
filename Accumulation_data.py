@@ -475,15 +475,24 @@ def process_stats(input_file=None, output_file=None):
         # gap-finder file when we have a match. We only add this to team_total
         # rows (not players) and only when a match exists, so player records
         # and unmatched team_totals stay untouched.
+        #
+        # Use max(gap_count, GP). The gap finder occasionally undercounts (its
+        # schedule walker can disagree with the scraper's by 1-2 games when
+        # MaxPreps returns a slightly different schedule shape per call). GP
+        # is the count of distinct games we actually accumulated stats for,
+        # so TotalGamesChecked must never be less than GP — otherwise the
+        # output reports we "checked" fewer games than we have data for.
         season_record = format_record("Season Totals", season_totals_accumulated, "team_total")
         gc = games_checked_lookup.get((t_id, team_name))
         if gc is not None:
+            gp = int(season_record.get('GP') or 0)
+            total_games_checked = max(int(gc), gp)
             # Reinsert keys in order so TotalGamesChecked lands right after GP.
             new_rec = {}
             for k, v in season_record.items():
                 new_rec[k] = v
                 if k == 'GP':
-                    new_rec['TotalGamesChecked'] = gc
+                    new_rec['TotalGamesChecked'] = total_games_checked
             season_record = new_rec
         final_output_list.append(season_record)
 

@@ -357,6 +357,10 @@ def main():
     parser.add_argument("--state", default=os.environ.get("STATE", "TX"), help="State code (default: TX)")
     parser.add_argument("--sport", default=os.environ.get("SPORT", "boys"), choices=["boys", "girls"], help="boys (default) or girls")
     parser.add_argument("--season", default=os.environ.get("SEASON", "2025-2026"), help="Season (e.g., 2025-2026 or 25-26)")
+    parser.add_argument("--gap-only", action="store_true",
+                        help="Only run gap-finder; skip the auto-chained box-score "
+                             "scraper. Use this when an external orchestrator (e.g. "
+                             "APP/pipeline.py) drives later stages explicitly.")
     args = parser.parse_args()
 
     state_code  = args.state.upper()
@@ -619,8 +623,16 @@ def main():
         print("This usually means MaxPreps hasn't posted the leagues for this season yet.")
         sys.exit(0)
 
-    print(f"\nSaved {total} teams to {output_file}. Starting scraper...")
-    
+    print(f"\nSaved {total} teams to {output_file}.")
+
+    # Skip the auto-chained box-score scraper when an external orchestrator
+    # is driving the pipeline (e.g. APP/pipeline.py wires the stages itself).
+    if getattr(args, 'gap_only', False):
+        print("[--gap-only] Skipping auto-chained scraper. Stop.")
+        return
+
+    print("Starting scraper...")
+
     # Auto-run Scraper
     try:
         from scrape_box_scores import run as scrape_run
