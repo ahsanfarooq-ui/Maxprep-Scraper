@@ -403,7 +403,7 @@ def run(state="TX", sport="boys", season="2025-2026", workers=None, output_file=
     teams, master_file = _load_master_for_state(sport, season, state_code)
     if teams is None:
         print(f"[ERROR] No master file found for {sport} {state_code} (season {season}).")
-        print("        Run state_team_counter_updated.py first to build it.")
+        print("        Run state_teams_counter.py first to build it.")
         return None
 
     if output_file is None:
