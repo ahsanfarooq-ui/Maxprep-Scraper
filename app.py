@@ -92,12 +92,32 @@ _bid_value   = None
 _bid_version = 0
 
 def _fetch_raw_bid():
-    r = requests.get("https://www.maxpreps.com", headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    m = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", r.text)
-    if not m:
-        raise RuntimeError("Build ID not found")
-    return m.group(1)
+    """Extract the Next.js buildId that serves team-schedule API calls.
+
+    MaxPreps sometimes runs two builds simultaneously — one serves the
+    homepage, another serves team pages. Reading the buildId from the
+    homepage and then using it on /_next/data/{bid}/{team}/schedule.json
+    yields 404/406 across every team. We hit a known-stable team SCHEDULE
+    page first because that page's build is the one that's authoritative
+    for the schedule.json endpoint we actually call.
+    """
+    seed_pages = [
+        "https://www.maxpreps.com/tx/austin/austin-maroons/basketball/schedule/",
+        "https://www.maxpreps.com/ca/concord/de-la-salle-spartans/basketball/schedule/",
+        "https://www.maxpreps.com",   # last-resort fallback
+    ]
+    last_err = None
+    for url in seed_pages:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            r.raise_for_status()
+            m = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", r.text)
+            if m:
+                return m.group(1)
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(f"Build ID not found in any seed page. Last error: {last_err}")
 
 def get_build_id():
     global _bid_value, _bid_version

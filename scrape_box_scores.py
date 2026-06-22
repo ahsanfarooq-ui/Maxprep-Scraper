@@ -99,20 +99,37 @@ _bid_value = None
 _bid_version = 0
 
 def _fetch_build_id_raw():
-    """Fetch the build ID with retry. Caller must hold _bid_lock."""
+    """Fetch the build ID from a team SCHEDULE page (not the homepage).
+
+    MaxPreps sometimes runs two builds simultaneously — one serves the
+    homepage, another serves team pages. Reading the buildId from the
+    homepage and then using it on /_next/data/{bid}/{team}/schedule.json
+    yields 404/406 across every team. We hit a known-stable team page
+    first because that page's build is the one that's authoritative for
+    the schedule.json endpoint we call. Falls back to the homepage if
+    no team page returns a usable buildId.
+
+    Caller must hold _bid_lock.
+    """
     delays = [5, 10, 20, 40, 60]
+    seed_pages = [
+        "https://www.maxpreps.com/tx/austin/austin-maroons/basketball/schedule/",
+        "https://www.maxpreps.com/ca/concord/de-la-salle-spartans/basketball/schedule/",
+        "https://www.maxpreps.com",   # last-resort fallback
+    ]
     last_err = None
     for attempt, wait in enumerate(delays, 1):
-        try:
-            r = _get_session().get("https://www.maxpreps.com", timeout=30, headers=HTML_HEADERS)
-            r.raise_for_status()
-            m = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", r.text)
-            if m:
-                return m.group(1)
-            print(f"  [WARN] Build ID not found in page (attempt {attempt}/{len(delays)}). Waiting {wait}s…")
-        except Exception as e:
-            last_err = e
-            print(f"  [WARN] Build ID fetch error: {e} (attempt {attempt}/{len(delays)}). Waiting {wait}s…")
+        for url in seed_pages:
+            try:
+                r = _get_session().get(url, timeout=30, headers=HTML_HEADERS)
+                r.raise_for_status()
+                m = re.search(r"/_next/static/([a-zA-Z0-9_-]+)/_buildManifest\.js", r.text)
+                if m:
+                    return m.group(1)
+            except Exception as e:
+                last_err = e
+                continue
+        print(f"  [WARN] Build ID not found in any seed page (attempt {attempt}/{len(delays)}). Waiting {wait}s…")
         time.sleep(wait)
     raise RuntimeError(f"MaxPreps build ID not found after all retries: {last_err}")
 
